@@ -46,6 +46,7 @@ unicode_expressions = ["unicode-segmentation"]
 [dependencies]
 ahash = "0.7"
 hashbrown = "0.11"
+# NOTE: the ul branch in arrow-rs needs to point to 4.3.0 for now
 arrow = { git = "https://github.com/urbanlogiq/arrow-rs", branch = "ul", features = ["prettyprint"] }
 parquet = { git = "https://github.com/urbanlogiq/arrow-rs", branch = "ul", features = ["arrow"] }
 sqlparser = "0.9.0"
