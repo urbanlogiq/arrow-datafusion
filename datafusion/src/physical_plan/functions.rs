@@ -975,7 +975,7 @@ pub fn create_physical_expr(
         // so we don't have to pay a per-array/batch cost.
         BuiltinScalarFunction::ToTimestamp => {
             Arc::new(match args[0].data_type(input_schema) {
-                Ok(DataType::Int64) | Ok(DataType::Timestamp(_, None)) => {
+                Ok(DataType::Int64) | Ok(DataType::Timestamp(_, _)) => {
                     |col_values: &[ColumnarValue]| {
                         cast_column(
                             &col_values[0],
@@ -995,7 +995,7 @@ pub fn create_physical_expr(
         }
         BuiltinScalarFunction::ToTimestampMillis => {
             Arc::new(match args[0].data_type(input_schema) {
-                Ok(DataType::Int64) | Ok(DataType::Timestamp(_, None)) => {
+                Ok(DataType::Int64) | Ok(DataType::Timestamp(_, _)) => {
                     |col_values: &[ColumnarValue]| {
                         cast_column(
                             &col_values[0],
