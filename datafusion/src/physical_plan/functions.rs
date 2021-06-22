@@ -1152,6 +1152,8 @@ fn signature(fun: &BuiltinScalarFunction) -> Signature {
                 DataType::Utf8,
                 DataType::Int64,
                 DataType::Timestamp(TimeUnit::Nanosecond, None),
+                // UL: This is added just for UL convenience to auto convert NS columns with UTC timezone
+                DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".to_string())),
                 DataType::Timestamp(TimeUnit::Microsecond, None),
                 DataType::Timestamp(TimeUnit::Second, None),
             ],
