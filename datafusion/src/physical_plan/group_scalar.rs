@@ -71,7 +71,8 @@ impl TryFrom<&ScalarValue> for GroupByScalar {
             ScalarValue::TimestampMicrosecond(Some(v)) => {
                 GroupByScalar::TimeMicrosecond(*v)
             }
-            ScalarValue::TimestampNanosecond(Some(v)) => {
+            ScalarValue::TimestampNanosecond(Some(v), _) => {
+                // TODO: is timezone info needed for GroupByScalar?
                 GroupByScalar::TimeNanosecond(*v)
             }
             ScalarValue::Utf8(Some(v)) => GroupByScalar::Utf8(Box::new(v.clone())),
@@ -128,7 +129,8 @@ impl From<&GroupByScalar> for ScalarValue {
                 ScalarValue::TimestampMicrosecond(Some(*v))
             }
             GroupByScalar::TimeNanosecond(v) => {
-                ScalarValue::TimestampNanosecond(Some(*v))
+                // TODO: is it necessary to recover TZ info here?
+                ScalarValue::TimestampNanosecond(Some(*v), None)
             }
             GroupByScalar::Date32(v) => ScalarValue::Date32(Some(*v)),
         }

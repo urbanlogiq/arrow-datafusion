@@ -214,11 +214,14 @@ impl<'a> ExprRewriter for ConstantRewriter<'a> {
             Expr::ScalarFunction {
                 fun: BuiltinScalarFunction::Now,
                 ..
-            } => Expr::Literal(ScalarValue::TimestampNanosecond(Some(
-                self.execution_props
-                    .query_execution_start_time
-                    .timestamp_nanos(),
-            ))),
+            } => Expr::Literal(ScalarValue::TimestampNanosecond(
+                Some(
+                    self.execution_props
+                        .query_execution_start_time
+                        .timestamp_nanos(),
+                ),
+                None,
+            )), // Execution start time is a local timestamp, so set TZ to None
             Expr::ScalarFunction {
                 fun: BuiltinScalarFunction::ToTimestamp,
                 args,
@@ -226,10 +229,16 @@ impl<'a> ExprRewriter for ConstantRewriter<'a> {
                 if !args.is_empty() {
                     match &args[0] {
                         Expr::Literal(ScalarValue::Utf8(Some(val))) => {
+                            // TODO: amend string_to_timestamp_nanos() to recover whether string has
+                            // UTC or other timezone or the returned result is using local timezone.
+                            // Unfortunately for now we cannot tell, so just use None/No TZ for now.
                             match string_to_timestamp_nanos(val) {
-                                Ok(timestamp) => Expr::Literal(
-                                    ScalarValue::TimestampNanosecond(Some(timestamp)),
-                                ),
+                                Ok(timestamp) => {
+                                    Expr::Literal(ScalarValue::TimestampNanosecond(
+                                        Some(timestamp),
+                                        None,
+                                    ))
+                                }
                                 _ => Expr::ScalarFunction {
                                     fun: BuiltinScalarFunction::ToTimestamp,
                                     args,
@@ -697,7 +706,7 @@ mod tests {
             .build()
             .unwrap();
 
-        let expected = "Projection: TimestampNanosecond(1599566400000000000)\
+        let expected = "Projection: TimestampNanosecond(1599566400000000000, None)\
             \n  TableScan: test projection=None"
             .to_string();
         let actual = get_optimized_plan_formatted(&plan, &chrono::Utc::now());
@@ -797,7 +806,7 @@ mod tests {
             .unwrap();
 
         let expected = format!(
-            "Projection: TimestampNanosecond({})\
+            "Projection: TimestampNanosecond({}, None)\
             \n  TableScan: test projection=None",
             time.timestamp_nanos()
         );
@@ -831,7 +840,7 @@ mod tests {
 
         let actual = get_optimized_plan_formatted(&plan, &time);
         let expected = format!(
-            "Projection: TimestampNanosecond({}), TimestampNanosecond({}) AS t2\
+            "Projection: TimestampNanosecond({}, None), TimestampNanosecond({}, None) AS t2\
             \n  TableScan: test projection=None",
             time.timestamp_nanos(),
             time.timestamp_nanos()

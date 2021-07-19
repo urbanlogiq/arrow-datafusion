@@ -113,6 +113,14 @@ macro_rules! typed_min_max_batch {
     }};
 }
 
+macro_rules! typed_min_max_batch_tz {
+    ($VALUES:expr, $ARRAYTYPE:ident, $SCALAR:ident, $OP:ident, $TZ:expr) => {{
+        let array = $VALUES.as_any().downcast_ref::<$ARRAYTYPE>().unwrap();
+        let value = compute::$OP(array);
+        ScalarValue::$SCALAR(value, $TZ.clone())
+    }};
+}
+
 // Statically-typed version of min/max(array) -> ScalarValue  for non-string types.
 // this is a macro to support both operations (min and max).
 macro_rules! min_max_batch {
@@ -148,11 +156,12 @@ macro_rules! min_max_batch {
                 TimestampMicrosecond,
                 $OP
             ),
-            DataType::Timestamp(TimeUnit::Nanosecond, _) => typed_min_max_batch!(
+            DataType::Timestamp(TimeUnit::Nanosecond, tz_opt) => typed_min_max_batch_tz!(
                 $VALUES,
                 TimestampNanosecondArray,
                 TimestampNanosecond,
-                $OP
+                $OP,
+                tz_opt
             ),
             other => {
                 // This should have been handled before
@@ -200,6 +209,21 @@ macro_rules! typed_min_max {
             (None, Some(b)) => Some(b.clone()),
             (Some(a), Some(b)) => Some((*a).$OP(*b)),
         })
+    }};
+}
+
+// min/max of two non-string timestamp scalars with given timezone
+macro_rules! typed_min_max_tz {
+    ($VALUE:expr, $DELTA:expr, $SCALAR:ident, $OP:ident, $TZ:expr) => {{
+        ScalarValue::$SCALAR(
+            match ($VALUE, $DELTA) {
+                (None, None) => None,
+                (Some(a), None) => Some(a.clone()),
+                (None, Some(b)) => Some(b.clone()),
+                (Some(a), Some(b)) => Some((*a).$OP(*b)),
+            },
+            $TZ.clone(),
+        )
     }};
 }
 
@@ -271,10 +295,10 @@ macro_rules! min_max {
                 typed_min_max!(lhs, rhs, TimestampMicrosecond, $OP)
             }
             (
-                ScalarValue::TimestampNanosecond(lhs),
-                ScalarValue::TimestampNanosecond(rhs),
+                ScalarValue::TimestampNanosecond(lhs, l_tz),
+                ScalarValue::TimestampNanosecond(rhs, _),
             ) => {
-                typed_min_max!(lhs, rhs, TimestampNanosecond, $OP)
+                typed_min_max_tz!(lhs, rhs, TimestampNanosecond, $OP, l_tz)
             }
             e => {
                 return Err(DataFusionError::Internal(format!(

@@ -303,7 +303,7 @@ pub fn to_timestamp_seconds(args: &[ColumnarValue]) -> Result<ColumnarValue> {
 ///
 /// The semantics of `now()` require it to return the same value
 /// whenever it is called in a query. This this value is chosen during
-/// planning time and bound into a closure that
+/// planning time and bound into a closure that returns the timestamp.
 pub fn make_now(
     now_ts: DateTime<Utc>,
 ) -> impl Fn(&[ColumnarValue]) -> Result<ColumnarValue> {
@@ -311,6 +311,7 @@ pub fn make_now(
     move |_arg| {
         Ok(ColumnarValue::Scalar(ScalarValue::TimestampNanosecond(
             now_ts,
+            Some("UTC".to_owned()), // now_ts is guaranteed to be UTC, so enforce UTC timezone
         )))
     }
 }
@@ -371,8 +372,11 @@ pub fn date_trunc(args: &[ColumnarValue]) -> Result<ColumnarValue> {
 
     Ok(match array {
         ColumnarValue::Scalar(scalar) => {
-            if let ScalarValue::TimestampNanosecond(v) = scalar {
-                ColumnarValue::Scalar(ScalarValue::TimestampNanosecond((f)(*v)?))
+            if let ScalarValue::TimestampNanosecond(v, tz_opt) = scalar {
+                ColumnarValue::Scalar(ScalarValue::TimestampNanosecond(
+                    (f)(*v)?,
+                    tz_opt.clone(),
+                ))
             } else {
                 return Err(DataFusionError::Execution(
                     "array of `date_trunc` must be non-null scalar Utf8".to_string(),
