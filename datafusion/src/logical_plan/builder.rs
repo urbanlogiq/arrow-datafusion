@@ -32,7 +32,10 @@ use crate::datasource::TableProvider;
 use crate::error::{DataFusionError, Result};
 use crate::logical_plan::{DFField, DFSchema, DFSchemaRef, Partitioning};
 use crate::{
-    datasource::{empty::EmptyTable, parquet::ParquetTable, CsvFile, MemTable},
+    datasource::{
+        empty::EmptyTable, parquet::ParquetSource, parquet::ParquetTable, CsvFile,
+        MemTable,
+    },
     prelude::CsvReadOptions,
 };
 use std::collections::HashSet;
@@ -121,7 +124,10 @@ impl LogicalPlanBuilder {
         projection: Option<Vec<usize>>,
         max_concurrency: usize,
     ) -> Result<Self> {
-        let provider = Arc::new(ParquetTable::try_new(path, max_concurrency)?);
+        let provider = Arc::new(ParquetTable::try_new(
+            ParquetSource::Path(path.to_owned()),
+            max_concurrency,
+        )?);
         Self::scan("", provider, projection)
     }
 

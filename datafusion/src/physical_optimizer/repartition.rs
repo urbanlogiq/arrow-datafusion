@@ -110,6 +110,7 @@ mod tests {
 
     use super::*;
     use crate::datasource::datasource::Statistics;
+    use crate::datasource::parquet::ParquetSource;
     use crate::physical_plan::parquet::{ParquetExec, ParquetPartition};
     use crate::physical_plan::projection::ProjectionExec;
 
@@ -120,7 +121,7 @@ mod tests {
             vec![],
             Arc::new(ParquetExec::new(
                 vec![ParquetPartition {
-                    filenames: vec!["x".to_string()],
+                    sources: vec![ParquetSource::Path("x".to_string())],
                     statistics: Statistics::default(),
                 }],
                 schema,
@@ -157,7 +158,7 @@ mod tests {
                 vec![],
                 Arc::new(ParquetExec::new(
                     vec![ParquetPartition {
-                        filenames: vec!["x".to_string()],
+                        sources: vec![ParquetSource::Path("x".to_string())],
                         statistics: Statistics::default(),
                     }],
                     schema,

@@ -47,7 +47,7 @@ use crate::catalog::{
     ResolvedTableReference, TableReference,
 };
 use crate::datasource::csv::CsvFile;
-use crate::datasource::parquet::ParquetTable;
+use crate::datasource::parquet::{ParquetSource, ParquetTable};
 use crate::datasource::TableProvider;
 use crate::error::{DataFusionError, Result};
 use crate::execution::dataframe_impl::DataFrameImpl;
@@ -189,7 +189,10 @@ impl ExecutionContext {
                     Ok(Arc::new(DataFrameImpl::new(self.state.clone(), &plan)))
                 }
                 FileType::Parquet => {
-                    self.register_parquet(name, location)?;
+                    self.register_parquet(
+                        name,
+                        ParquetSource::Path(location.to_owned()),
+                    )?;
                     let plan = LogicalPlanBuilder::empty(false).build()?;
                     Ok(Arc::new(DataFrameImpl::new(self.state.clone(), &plan)))
                 }
@@ -326,11 +329,9 @@ impl ExecutionContext {
 
     /// Registers a Parquet data source so that it can be referenced from SQL statements
     /// executed against this context.
-    pub fn register_parquet(&mut self, name: &str, filename: &str) -> Result<()> {
-        let table = ParquetTable::try_new(
-            filename,
-            self.state.lock().unwrap().config.concurrency,
-        )?;
+    pub fn register_parquet(&mut self, name: &str, source: ParquetSource) -> Result<()> {
+        let table =
+            ParquetTable::try_new(source, self.state.lock().unwrap().config.concurrency)?;
         self.register_table(name, Arc::new(table))?;
         Ok(())
     }
@@ -2439,11 +2440,23 @@ mod tests {
         let mut ctx = ExecutionContext::new();
 
         // register each partition as well as the top level dir
-        ctx.register_parquet("part0", &format!("{}/part-0.parquet", out_dir))?;
-        ctx.register_parquet("part1", &format!("{}/part-1.parquet", out_dir))?;
-        ctx.register_parquet("part2", &format!("{}/part-2.parquet", out_dir))?;
-        ctx.register_parquet("part3", &format!("{}/part-3.parquet", out_dir))?;
-        ctx.register_parquet("allparts", &out_dir)?;
+        ctx.register_parquet(
+            "part0",
+            ParquetSource::Path(format!("{}/part-0.parquet", out_dir)),
+        )?;
+        ctx.register_parquet(
+            "part1",
+            ParquetSource::Path(format!("{}/part-1.parquet", out_dir)),
+        )?;
+        ctx.register_parquet(
+            "part2",
+            ParquetSource::Path(format!("{}/part-2.parquet", out_dir)),
+        )?;
+        ctx.register_parquet(
+            "part3",
+            ParquetSource::Path(format!("{}/part-3.parquet", out_dir)),
+        )?;
+        ctx.register_parquet("allparts", ParquetSource::Path(out_dir.to_owned()))?;
 
         let part0 = plan_and_collect(&mut ctx, "SELECT c1, c2 FROM part0").await?;
         let allparts = plan_and_collect(&mut ctx, "SELECT c1, c2 FROM allparts").await?;

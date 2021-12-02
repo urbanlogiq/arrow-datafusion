@@ -35,6 +35,7 @@ use arrow::{
     util::display::array_value_to_string,
 };
 
+use datafusion::datasource::parquet::ParquetSource;
 use datafusion::logical_plan::LogicalPlan;
 use datafusion::prelude::*;
 use datafusion::{
@@ -131,8 +132,11 @@ async fn parquet_query() {
 async fn parquet_single_nan_schema() {
     let mut ctx = ExecutionContext::new();
     let testdata = datafusion::test_util::parquet_test_data();
-    ctx.register_parquet("single_nan", &format!("{}/single_nan.parquet", testdata))
-        .unwrap();
+    ctx.register_parquet(
+        "single_nan",
+        ParquetSource::Path(format!("{}/single_nan.parquet", testdata)),
+    )
+    .unwrap();
     let sql = "SELECT mycol FROM single_nan";
     let plan = ctx.create_logical_plan(sql).unwrap();
     let plan = ctx.optimize(&plan).unwrap();
@@ -151,7 +155,7 @@ async fn parquet_list_columns() {
     let testdata = datafusion::test_util::parquet_test_data();
     ctx.register_parquet(
         "list_columns",
-        &format!("{}/list_columns.parquet", testdata),
+        ParquetSource::Path(format!("{}/list_columns.parquet", testdata)),
     )
     .unwrap();
 
@@ -2446,7 +2450,7 @@ fn register_alltypes_parquet(ctx: &mut ExecutionContext) {
     let testdata = datafusion::test_util::parquet_test_data();
     ctx.register_parquet(
         "alltypes_plain",
-        &format!("{}/alltypes_plain.parquet", testdata),
+        ParquetSource::Path(format!("{}/alltypes_plain.parquet", testdata)),
     )
     .unwrap();
 }

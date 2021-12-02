@@ -24,6 +24,7 @@ use std::task::{Context, Poll};
 use std::{any::Any, convert::TryInto};
 
 use crate::{
+    datasource::parquet::ParquetSource,
     error::{DataFusionError, Result},
     logical_plan::Expr,
     physical_optimizer::pruning::{PruningPredicate, PruningStatistics},
@@ -48,6 +49,9 @@ use parquet::file::{
 
 use fmt::Debug;
 use parquet::arrow::{ArrowReader, ParquetFileArrowReader};
+use parquet::file::reader::ChunkReader;
+use parquet::file::reader::Length;
+use std::io::Read;
 
 use tokio::{
     sync::mpsc::{channel, Receiver, Sender},
@@ -90,37 +94,114 @@ pub struct ParquetExec {
 #[derive(Debug, Clone)]
 pub struct ParquetPartition {
     /// The Parquet filename for this partition
-    pub filenames: Vec<String>,
+    pub sources: Vec<ParquetSource>,
     /// Statistics for this partition
     pub statistics: Statistics,
+}
+
+/// BufChunkReader is a ChunkReader-implementing type for buffers so that in-memory
+/// data can be parsed by the Parquet library.
+#[derive(Clone)]
+pub struct BufChunkReader {
+    content: Arc<Vec<u8>>,
+    ptr: usize,
+    length: usize,
+}
+
+impl std::fmt::Debug for BufChunkReader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BufChunkReader")
+            .field("content", &self.content.len())
+            .field("ptr", &self.ptr)
+            .field("length", &self.length)
+            .finish()
+    }
+}
+
+impl BufChunkReader {
+    /// Create a new instance of a BufChunkReader
+    pub fn new(content: Arc<Vec<u8>>) -> Self {
+        let length = content.len();
+
+        Self {
+            content: content.clone(),
+            ptr: 0,
+            length,
+        }
+    }
+}
+
+impl Length for BufChunkReader {
+    fn len(&self) -> u64 {
+        self.content.len() as u64
+    }
+}
+
+impl Read for BufChunkReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let src_available = self.length - self.ptr;
+        let dest_available = buf.len();
+        let to_copy = src_available.min(dest_available);
+
+        let src = &self.content[self.ptr..self.ptr + to_copy];
+        let dest = &mut buf[0..to_copy];
+        dest.copy_from_slice(src);
+
+        self.ptr += to_copy;
+        Ok(to_copy)
+    }
+}
+
+impl ChunkReader for BufChunkReader {
+    type T = Self;
+    fn get_read(
+        &self,
+        start: u64,
+        length: usize,
+    ) -> std::result::Result<Self, parquet::errors::ParquetError> {
+        let ptr = start as usize;
+        let length = self.content.len().min(ptr + length);
+
+        let clone = Self {
+            content: self.content.clone(),
+            ptr,
+            length,
+        };
+        Ok(clone)
+    }
 }
 
 impl ParquetExec {
     /// Create a new Parquet reader execution plan based on the specified Parquet filename or
     /// directory containing Parquet files
-    pub fn try_from_path(
-        path: &str,
+    pub fn try_from_source(
+        source: &ParquetSource,
         projection: Option<Vec<usize>>,
         predicate: Option<Expr>,
         batch_size: usize,
         max_concurrency: usize,
         limit: Option<usize>,
     ) -> Result<Self> {
+        let sources = match source {
+            ParquetSource::Path(path) => common::build_file_list(path, ".parquet")?
+                .into_iter()
+                .map(|x| ParquetSource::Path(x.to_owned()))
+                .collect::<Vec<_>>(),
+            ParquetSource::Buffer(b) => {
+                vec![ParquetSource::Buffer(b.clone())]
+            }
+        };
+
         // build a list of filenames from the specified path, which could be a single file or
         // a directory containing one or more parquet files
-        let filenames = common::build_file_list(path, ".parquet")?;
-        if filenames.is_empty() {
+        if sources.is_empty() {
             Err(DataFusionError::Plan(format!(
                 "No Parquet files found at path {}",
-                path
+                source
             )))
         } else {
-            let filenames = filenames
-                .iter()
-                .map(|filename| filename.as_str())
-                .collect::<Vec<&str>>();
-            Self::try_from_files(
-                &filenames,
+            Self::try_from_sources(
+                &sources,
                 projection,
                 predicate,
                 batch_size,
@@ -132,8 +213,8 @@ impl ParquetExec {
 
     /// Create a new Parquet reader execution plan based on the specified list of Parquet
     /// files
-    pub fn try_from_files(
-        filenames: &[&str],
+    pub fn try_from_sources(
+        sources: &[ParquetSource],
         projection: Option<Vec<usize>>,
         predicate: Option<Expr>,
         batch_size: usize,
@@ -144,29 +225,48 @@ impl ParquetExec {
         // used in this data set
         let mut schemas: Vec<Schema> = vec![];
         let mut partitions = Vec::with_capacity(max_concurrency);
-        let filenames: Vec<String> = filenames.iter().map(|s| s.to_string()).collect();
-        let chunks = split_files(&filenames, max_concurrency);
+
+        let chunks = split_sources(&sources, max_concurrency);
+
         let mut num_rows = 0;
         let mut total_byte_size = 0;
         let mut null_counts = Vec::new();
         let mut limit_exhausted = false;
         for chunk in chunks {
-            let mut filenames: Vec<String> =
-                chunk.iter().map(|x| x.to_string()).collect();
+            let mut sources: Vec<ParquetSource> = chunk.to_vec();
             let mut total_files = 0;
-            for filename in &filenames {
+            for source in &sources {
                 total_files += 1;
-                let file = File::open(filename)?;
-                let file_reader = Arc::new(SerializedFileReader::new(file)?);
-                let mut arrow_reader = ParquetFileArrowReader::new(file_reader);
-                let meta_data = arrow_reader.get_metadata();
-                // collect all the unique schemas in this data set
-                let schema = arrow_reader.get_schema()?;
+
+                let (schema, meta_data) = match source {
+                    ParquetSource::Path(filename) => {
+                        let file = File::open(filename)?;
+                        let file_reader = Arc::new(SerializedFileReader::new(file)?);
+                        let mut arrow_reader = ParquetFileArrowReader::new(file_reader);
+                        let meta_data = arrow_reader.get_metadata();
+                        // collect all the unique schemas in this data set
+                        let schema = arrow_reader.get_schema()?;
+
+                        (schema, meta_data)
+                    }
+                    ParquetSource::Buffer(buffer) => {
+                        let buf_chunk_reader = BufChunkReader::new(buffer.clone());
+                        let buf_reader =
+                            Arc::new(SerializedFileReader::new(buf_chunk_reader)?);
+                        let mut arrow_reader = ParquetFileArrowReader::new(buf_reader);
+                        let meta_data = arrow_reader.get_metadata();
+                        let schema = arrow_reader.get_schema()?;
+                        (schema, meta_data)
+                    }
+                };
+
                 let num_fields = schema.fields().len();
+
                 if schemas.is_empty() || schema != schemas[0] {
                     schemas.push(schema);
                     null_counts = vec![0; num_fields]
                 }
+
                 for row_group_meta in meta_data.row_groups() {
                     num_rows += row_group_meta.num_rows();
                     total_byte_size += row_group_meta.total_byte_size();
@@ -204,9 +304,9 @@ impl ParquetExec {
                 column_statistics: Some(column_stats),
             };
             // remove files that are not needed in case of limit
-            filenames.truncate(total_files);
+            sources.truncate(total_files);
             partitions.push(ParquetPartition {
-                filenames,
+                sources,
                 statistics,
             });
             if limit_exhausted {
@@ -337,16 +437,16 @@ impl ParquetExec {
 
 impl ParquetPartition {
     /// Create a new parquet partition
-    pub fn new(filenames: Vec<String>, statistics: Statistics) -> Self {
+    pub fn new(sources: Vec<ParquetSource>, statistics: Statistics) -> Self {
         Self {
-            filenames,
+            sources,
             statistics,
         }
     }
 
     /// The Parquet filename for this partition
-    pub fn filenames(&self) -> &[String] {
-        &self.filenames
+    pub fn sources(&self) -> &[ParquetSource] {
+        &self.sources
     }
 
     /// Statistics for this partition
@@ -398,15 +498,15 @@ impl ExecutionPlan for ParquetExec {
             Receiver<ArrowResult<RecordBatch>>,
         ) = channel(2);
 
-        let filenames = self.partitions[partition].filenames.clone();
+        let sources = self.partitions[partition].sources.clone();
         let projection = self.projection.clone();
         let predicate_builder = self.predicate_builder.clone();
         let batch_size = self.batch_size;
         let limit = self.limit;
 
         task::spawn_blocking(move || {
-            if let Err(e) = read_files(
-                &filenames,
+            if let Err(e) = read_sources(
+                &sources,
                 &projection,
                 &predicate_builder,
                 batch_size,
@@ -433,7 +533,7 @@ impl ExecutionPlan for ParquetExec {
                 let files: Vec<_> = self
                     .partitions
                     .iter()
-                    .map(|pp| pp.filenames.iter())
+                    .map(|pp| pp.sources.iter())
                     .flatten()
                     .map(|s| s.as_str())
                     .collect();
@@ -568,8 +668,8 @@ fn build_row_group_predicate(
     Box::new(move |_, i| predicate_values[i])
 }
 
-fn read_files(
-    filenames: &[String],
+fn read_sources(
+    sources: &[ParquetSource],
     projection: &[usize],
     predicate_builder: &Option<PruningPredicate>,
     batch_size: usize,
@@ -577,17 +677,39 @@ fn read_files(
     limit: Option<usize>,
 ) -> Result<()> {
     let mut total_rows = 0;
-    'outer: for filename in filenames {
-        let file = File::open(&filename)?;
-        let mut file_reader = SerializedFileReader::new(file)?;
-        if let Some(predicate_builder) = predicate_builder {
-            let row_group_predicate = build_row_group_predicate(
-                predicate_builder,
-                file_reader.metadata().row_groups(),
-            );
-            file_reader.filter_row_groups(&row_group_predicate);
-        }
-        let mut arrow_reader = ParquetFileArrowReader::new(Arc::new(file_reader));
+    'outer: for source in sources {
+        let reader: Arc<dyn FileReader> = match source {
+            ParquetSource::Path(filename) => {
+                let file = File::open(&filename)?;
+                let mut reader = SerializedFileReader::new(file)?;
+
+                if let Some(predicate_builder) = predicate_builder {
+                    let row_group_predicate = build_row_group_predicate(
+                        predicate_builder,
+                        reader.metadata().row_groups(),
+                    );
+                    reader.filter_row_groups(&row_group_predicate);
+                }
+
+                Arc::new(reader)
+            }
+            ParquetSource::Buffer(buffer) => {
+                let buf_chunk_reader = BufChunkReader::new(buffer.clone());
+                let mut reader = SerializedFileReader::new(buf_chunk_reader)?;
+
+                if let Some(predicate_builder) = predicate_builder {
+                    let row_group_predicate = build_row_group_predicate(
+                        predicate_builder,
+                        reader.metadata().row_groups(),
+                    );
+                    reader.filter_row_groups(&row_group_predicate);
+                }
+
+                Arc::new(reader)
+            }
+        };
+
+        let mut arrow_reader = ParquetFileArrowReader::new(reader);
         let mut batch_reader = arrow_reader
             .get_record_reader_by_columns(projection.to_owned(), batch_size)?;
         loop {
@@ -606,7 +728,7 @@ fn read_files(
                 Some(Err(e)) => {
                     let err_msg = format!(
                         "Error reading batch from {}: {}",
-                        filename,
+                        source.as_str(),
                         e.to_string()
                     );
                     // send error to operator
@@ -626,7 +748,7 @@ fn read_files(
     Ok(())
 }
 
-fn split_files(filenames: &[String], n: usize) -> Vec<&[String]> {
+fn split_sources(filenames: &[ParquetSource], n: usize) -> Vec<&[ParquetSource]> {
     let mut chunk_size = filenames.len() / n;
     if filenames.len() % n > 0 {
         chunk_size += 1;
@@ -668,25 +790,25 @@ mod tests {
     };
 
     #[test]
-    fn test_split_files() {
-        let filenames = vec![
-            "a".to_string(),
-            "b".to_string(),
-            "c".to_string(),
-            "d".to_string(),
-            "e".to_string(),
+    fn test_split_sources() {
+        let sources = vec![
+            ParquetSource::Path("a".to_string()),
+            ParquetSource::Path("b".to_string()),
+            ParquetSource::Path("c".to_string()),
+            ParquetSource::Path("d".to_string()),
+            ParquetSource::Path("e".to_string()),
         ];
 
-        let chunks = split_files(&filenames, 1);
+        let chunks = split_sources(&sources, 1);
         assert_eq!(1, chunks.len());
         assert_eq!(5, chunks[0].len());
 
-        let chunks = split_files(&filenames, 2);
+        let chunks = split_sources(&sources, 2);
         assert_eq!(2, chunks.len());
         assert_eq!(3, chunks[0].len());
         assert_eq!(2, chunks[1].len());
 
-        let chunks = split_files(&filenames, 5);
+        let chunks = split_sources(&sources, 5);
         assert_eq!(5, chunks.len());
         assert_eq!(1, chunks[0].len());
         assert_eq!(1, chunks[1].len());
@@ -694,7 +816,7 @@ mod tests {
         assert_eq!(1, chunks[3].len());
         assert_eq!(1, chunks[4].len());
 
-        let chunks = split_files(&filenames, 123);
+        let chunks = split_sources(&sources, 123);
         assert_eq!(5, chunks.len());
         assert_eq!(1, chunks[0].len());
         assert_eq!(1, chunks[1].len());
@@ -707,8 +829,8 @@ mod tests {
     async fn test() -> Result<()> {
         let testdata = crate::test_util::parquet_test_data();
         let filename = format!("{}/alltypes_plain.parquet", testdata);
-        let parquet_exec = ParquetExec::try_from_path(
-            &filename,
+        let parquet_exec = ParquetExec::try_from_source(
+            &ParquetSource::Path(filename),
             Some(vec![0, 1, 2]),
             None,
             1024,

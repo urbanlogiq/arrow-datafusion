@@ -179,36 +179,9 @@ impl TableProvider for MemTable {
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let columns: Vec<usize> = match projection {
-            Some(p) => p.clone(),
-            None => {
-                let l = self.schema.fields().len();
-                let mut v = Vec::with_capacity(l);
-                for i in 0..l {
-                    v.push(i);
-                }
-                v
-            }
-        };
-
-        let projected_columns: Result<Vec<Field>> = columns
-            .iter()
-            .map(|i| {
-                if *i < self.schema.fields().len() {
-                    Ok(self.schema.field(*i).clone())
-                } else {
-                    Err(DataFusionError::Internal(
-                        "Projection index out of range".to_string(),
-                    ))
-                }
-            })
-            .collect();
-
-        let projected_schema = Arc::new(Schema::new(projected_columns?));
-
         Ok(Arc::new(MemoryExec::try_new(
             &self.batches.clone(),
-            projected_schema,
+            self.schema(),
             projection.clone(),
         )?))
     }

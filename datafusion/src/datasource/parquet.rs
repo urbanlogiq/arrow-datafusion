@@ -32,9 +32,40 @@ use crate::physical_plan::ExecutionPlan;
 
 use super::datasource::TableProviderFilterPushDown;
 
+/// Source of a parquet may either be a disk file or a memory buffer
+#[derive(Clone)]
+pub enum ParquetSource {
+    /// Path to a file or directory on disk
+    Path(String),
+    /// A memory buffer
+    Buffer(Arc<Vec<u8>>),
+}
+
+impl ParquetSource {
+    /// Return a string representation of the source
+    pub fn as_str(&self) -> &str {
+        match self {
+            ParquetSource::Path(s) => &s,
+            ParquetSource::Buffer(_) => "<memory>",
+        }
+    }
+}
+
+impl std::fmt::Display for ParquetSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+impl std::fmt::Debug for ParquetSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
 /// Table-based representation of a `ParquetFile`.
 pub struct ParquetTable {
-    path: String,
+    source: ParquetSource,
     schema: SchemaRef,
     statistics: Statistics,
     max_concurrency: usize,
@@ -42,11 +73,11 @@ pub struct ParquetTable {
 
 impl ParquetTable {
     /// Attempt to initialize a new `ParquetTable` from a file path.
-    pub fn try_new(path: &str, max_concurrency: usize) -> Result<Self> {
-        let parquet_exec = ParquetExec::try_from_path(path, None, None, 0, 1, None)?;
+    pub fn try_new(source: ParquetSource, max_concurrency: usize) -> Result<Self> {
+        let parquet_exec = ParquetExec::try_from_source(&source, None, None, 0, 1, None)?;
         let schema = parquet_exec.schema();
         Ok(Self {
-            path: path.to_string(),
+            source,
             schema,
             statistics: parquet_exec.statistics().to_owned(),
             max_concurrency,
@@ -55,7 +86,10 @@ impl ParquetTable {
 
     /// Get the path for the Parquet file(s) represented by this ParquetTable instance
     pub fn path(&self) -> &str {
-        &self.path
+        match &self.source {
+            ParquetSource::Path(s) => &s,
+            ParquetSource::Buffer(_) => "<memory>",
+        }
     }
 }
 
@@ -86,8 +120,8 @@ impl TableProvider for ParquetTable {
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let predicate = combine_filters(filters);
-        Ok(Arc::new(ParquetExec::try_from_path(
-            &self.path,
+        Ok(Arc::new(ParquetExec::try_from_source(
+            &self.source,
             projection.clone(),
             predicate,
             limit
@@ -329,8 +363,8 @@ mod tests {
 
     fn load_table(name: &str) -> Result<Arc<dyn TableProvider>> {
         let testdata = crate::test_util::parquet_test_data();
-        let filename = format!("{}/{}", testdata, name);
-        let table = ParquetTable::try_new(&filename, 2)?;
+        let filename = ParquetSource::Path(format!("{}/{}", testdata, name));
+        let table = ParquetTable::try_new(filename, 2)?;
         Ok(Arc::new(table))
     }
 
