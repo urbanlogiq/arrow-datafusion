@@ -847,7 +847,7 @@ fn equal_rows(
             DataType::Float64 => {
                 equal_rows_elem!(Float64Array, l, r, left, right, null_equals_null)
             }
-            DataType::Timestamp(time_unit, None) => match time_unit {
+            DataType::Timestamp(time_unit, _) => match time_unit {
                 TimeUnit::Second => {
                     equal_rows_elem!(
                         TimestampSecondArray,
