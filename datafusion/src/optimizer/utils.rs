@@ -63,7 +63,7 @@ impl ExpressionVisitor for ColumnNameVisitor<'_> {
             Expr::Column(qc) => {
                 self.accum.insert(qc.clone());
             }
-            Expr::ScalarVariable(var_names) => {
+            Expr::ScalarVariable(_, var_names) => {
                 self.accum.insert(Column::from_name(var_names.join(".")));
             }
             Expr::Alias(_, _) => {}
@@ -326,7 +326,7 @@ pub fn expr_sub_expressions(expr: &Expr) -> Result<Vec<Expr>> {
         Expr::Column(_) => Ok(vec![]),
         Expr::Alias(expr, ..) => Ok(vec![expr.as_ref().to_owned()]),
         Expr::Literal(_) => Ok(vec![]),
-        Expr::ScalarVariable(_) => Ok(vec![]),
+        Expr::ScalarVariable(_, _) => Ok(vec![]),
         Expr::Not(expr) => Ok(vec![expr.as_ref().to_owned()]),
         Expr::Negative(expr) => Ok(vec![expr.as_ref().to_owned()]),
         Expr::Sort { expr, .. } => Ok(vec![expr.as_ref().to_owned()]),
@@ -474,7 +474,7 @@ pub fn rewrite_expression(expr: &Expr, expressions: &[Expr]) -> Result<Expr> {
         Expr::Negative(_) => Ok(Expr::Negative(Box::new(expressions[0].clone()))),
         Expr::Column(_) => Ok(expr.clone()),
         Expr::Literal(_) => Ok(expr.clone()),
-        Expr::ScalarVariable(_) => Ok(expr.clone()),
+        Expr::ScalarVariable(_, _) => Ok(expr.clone()),
         Expr::Sort {
             asc, nulls_first, ..
         } => Ok(Expr::Sort {
@@ -646,7 +646,7 @@ impl ConstEvaluator {
             Expr::Alias(..) => false,
             Expr::AggregateFunction { .. } => false,
             Expr::AggregateUDF { .. } => false,
-            Expr::ScalarVariable(_) => false,
+            Expr::ScalarVariable(_, _) => false,
             Expr::Column(_) => false,
             Expr::ScalarFunction { fun, .. } => Self::volatility_ok(fun.volatility()),
             Expr::ScalarUDF { fun, .. } => Self::volatility_ok(fun.signature.volatility),

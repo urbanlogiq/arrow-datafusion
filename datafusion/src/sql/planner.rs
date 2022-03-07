@@ -75,6 +75,8 @@ pub trait ContextProvider {
     fn get_function_meta(&self, name: &str) -> Option<Arc<ScalarUDF>>;
     /// Getter for a UDAF description
     fn get_aggregate_meta(&self, name: &str) -> Option<Arc<AggregateUDF>>;
+    /// Getter for a UDAF description
+    fn get_variable_type(&self, variable_names: &[String]) -> Option<DataType>;
 }
 
 /// SQL query planner
@@ -1270,7 +1272,16 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
             SQLExpr::Identifier(ref id) => {
                 if id.value.starts_with('@') {
                     let var_names = vec![id.value.clone()];
-                    Ok(Expr::ScalarVariable(var_names))
+                    let ty = self
+                        .schema_provider
+                        .get_variable_type(&var_names)
+                        .ok_or_else(|| {
+                            DataFusionError::Execution(format!(
+                                "variable {:?} has no type information",
+                                var_names
+                            ))
+                        })?;
+                    Ok(Expr::ScalarVariable(ty, var_names))
                 } else {
                     // create a column expression based on raw user input, this column will be
                     // normalized with qualifer later by the SQL planner.
@@ -1295,7 +1306,16 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
                     var_names.push(id.value.clone());
                 }
                 if &var_names[0][0..1] == "@" {
-                    Ok(Expr::ScalarVariable(var_names))
+                    let ty = self
+                        .schema_provider
+                        .get_variable_type(&var_names)
+                        .ok_or_else(|| {
+                            DataFusionError::Execution(format!(
+                                "variable {:?} has no type information",
+                                var_names
+                            ))
+                        })?;
+                    Ok(Expr::ScalarVariable(ty, var_names))
                 } else if var_names.len() == 2 {
                     // table.column identifier
                     let name = var_names.pop().unwrap();
@@ -3698,6 +3718,10 @@ mod tests {
         }
 
         fn get_aggregate_meta(&self, _name: &str) -> Option<Arc<AggregateUDF>> {
+            unimplemented!()
+        }
+
+        fn get_variable_type(&self, _: &[String]) -> Option<DataType> {
             unimplemented!()
         }
     }

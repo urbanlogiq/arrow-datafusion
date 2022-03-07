@@ -226,7 +226,7 @@ pub enum Expr {
     /// A named reference to a qualified filed in a schema.
     Column(Column),
     /// A named reference to a variable in a registry.
-    ScalarVariable(Vec<String>),
+    ScalarVariable(DataType, Vec<String>),
     /// A constant value.
     Literal(ScalarValue),
     /// A binary expression such as "age > 21"
@@ -382,7 +382,7 @@ impl Expr {
         match self {
             Expr::Alias(expr, _) => expr.get_type(schema),
             Expr::Column(c) => Ok(schema.field_from_column(c)?.data_type().clone()),
-            Expr::ScalarVariable(_) => Ok(DataType::Utf8),
+            Expr::ScalarVariable(ty, _) => Ok(ty.clone()),
             Expr::Literal(l) => Ok(l.get_datatype()),
             Expr::Case { when_then_expr, .. } => when_then_expr[0].1.get_type(schema),
             Expr::Cast { data_type, .. } => Ok(data_type.clone()),
@@ -460,7 +460,7 @@ impl Expr {
             Expr::Alias(expr, _) => expr.nullable(input_schema),
             Expr::Column(c) => Ok(input_schema.field_from_column(c)?.is_nullable()),
             Expr::Literal(value) => Ok(value.is_null()),
-            Expr::ScalarVariable(_) => Ok(true),
+            Expr::ScalarVariable(_, _) => Ok(true),
             Expr::Case {
                 when_then_expr,
                 else_expr,
@@ -837,7 +837,7 @@ impl Expr {
         let expr = match self {
             Expr::Alias(expr, name) => Expr::Alias(rewrite_boxed(expr, rewriter)?, name),
             Expr::Column(_) => self.clone(),
-            Expr::ScalarVariable(names) => Expr::ScalarVariable(names),
+            Expr::ScalarVariable(ty, names) => Expr::ScalarVariable(ty, names),
             Expr::Literal(value) => Expr::Literal(value),
             Expr::BinaryExpr { left, op, right } => Expr::BinaryExpr {
                 left: rewrite_boxed(left, rewriter)?,
@@ -1717,7 +1717,7 @@ impl fmt::Debug for Expr {
         match self {
             Expr::Alias(expr, alias) => write!(f, "{:?} AS {}", expr, alias),
             Expr::Column(c) => write!(f, "{}", c),
-            Expr::ScalarVariable(var_names) => write!(f, "{}", var_names.join(".")),
+            Expr::ScalarVariable(_, var_names) => write!(f, "{}", var_names.join(".")),
             Expr::Literal(v) => write!(f, "{:?}", v),
             Expr::Case {
                 expr,
@@ -1860,7 +1860,7 @@ fn create_name(e: &Expr, input_schema: &DFSchema) -> Result<String> {
     match e {
         Expr::Alias(_, name) => Ok(name.clone()),
         Expr::Column(c) => Ok(c.flat_name()),
-        Expr::ScalarVariable(variable_names) => Ok(variable_names.join(".")),
+        Expr::ScalarVariable(_, variable_names) => Ok(variable_names.join(".")),
         Expr::Literal(value) => Ok(format!("{:?}", value)),
         Expr::BinaryExpr { left, op, right } => {
             let left = create_name(left, input_schema)?;

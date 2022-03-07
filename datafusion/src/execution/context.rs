@@ -51,7 +51,7 @@ use std::{
 use futures::{StreamExt, TryStreamExt};
 use tokio::task::{self, JoinHandle};
 
-use arrow::{csv, datatypes::SchemaRef};
+use arrow::{csv, datatypes::DataType, datatypes::SchemaRef};
 
 use crate::catalog::{
     catalog::{CatalogProvider, MemoryCatalogProvider},
@@ -1144,6 +1144,22 @@ impl ContextProvider for ExecutionContextState {
 
     fn get_aggregate_meta(&self, name: &str) -> Option<Arc<AggregateUDF>> {
         self.aggregate_functions.get(name).cloned()
+    }
+
+    fn get_variable_type(&self, variable_names: &[String]) -> Option<DataType> {
+        if variable_names.is_empty() {
+            return None;
+        }
+
+        let provider_type = if &variable_names[0][0..2] == "@@" {
+            VarType::System
+        } else {
+            VarType::UserDefined
+        };
+
+        self.var_provider
+            .get(&provider_type)?
+            .get_type(variable_names)
     }
 }
 
