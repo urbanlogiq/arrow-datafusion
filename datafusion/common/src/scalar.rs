@@ -2253,6 +2253,7 @@ impl TryFrom<&DataType> for ScalarValue {
             DataType::Struct(fields) => {
                 ScalarValue::Struct(None, Box::new(fields.clone()))
             }
+            DataType::FixedSizeBinary(size) => ScalarValue::FixedSizeBinary(*size, None),
             DataType::Null => ScalarValue::Null,
             _ => {
                 return Err(DataFusionError::NotImplemented(format!(
