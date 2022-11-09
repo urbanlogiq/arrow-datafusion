@@ -1382,7 +1382,7 @@ impl ScalarValue {
                     .collect::<Result<Vec<_>>>()?;
                 let array = FixedSizeBinaryArray::try_from_sparse_iter_with_size(
                     array.into_iter(),
-                    *sz,
+                    Some(*sz),
                 )?;
                 Arc::new(array)
             }
@@ -1598,14 +1598,14 @@ impl ScalarValue {
                 Some(value) => Arc::new(
                     FixedSizeBinaryArray::try_from_sparse_iter_with_size(
                         repeat(Some(value.as_slice())).take(size),
-                        *sz,
+                        Some(*sz),
                     )
                     .unwrap(),
                 ),
                 None => Arc::new(
                     FixedSizeBinaryArray::try_from_sparse_iter_with_size(
                         repeat(None::<&[u8]>).take(size),
-                        *sz,
+                        Some(*sz),
                     )
                     .unwrap(),
                 ),
