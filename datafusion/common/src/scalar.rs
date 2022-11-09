@@ -1516,7 +1516,7 @@ impl ScalarValue {
                     _ => unreachable!("Invalid dictionary keys type: {:?}", key_type),
                 }
             }
-            DataType::FixedSizeBinary(_) => {
+            DataType::FixedSizeBinary(sz) => {
                 let array = scalars
                     .map(|sv| {
                         if let ScalarValue::FixedSizeBinary(_, v) = sv {
@@ -1530,8 +1530,10 @@ impl ScalarValue {
                         }
                     })
                     .collect::<Result<Vec<_>>>()?;
-                let array =
-                    FixedSizeBinaryArray::try_from_sparse_iter(array.into_iter())?;
+                let array = FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+                    array.into_iter(),
+                    *sz,
+                )?;
                 Arc::new(array)
             }
             // explicitly enumerate unsupported types so newly added
