@@ -25,14 +25,11 @@ mod delimited_stream;
 mod file_stream;
 mod json;
 mod parquet;
-mod row_filter;
 
 pub(crate) use self::csv::plan_to_csv;
 pub use self::csv::CsvExec;
 pub(crate) use self::parquet::plan_to_parquet;
-pub use self::parquet::{
-    ParquetExec, ParquetFileMetrics, ParquetFileReaderFactory, ParquetScanOptions,
-};
+pub use self::parquet::{ParquetExec, ParquetFileMetrics, ParquetFileReaderFactory};
 use arrow::{
     array::{ArrayData, ArrayRef, DictionaryArray},
     buffer::Buffer,
@@ -44,9 +41,10 @@ pub use avro::AvroExec;
 pub use file_stream::{FileOpenFuture, FileOpener, FileStream};
 pub(crate) use json::plan_to_json;
 pub use json::NdJsonExec;
+use parking_lot::RwLock;
 
-use crate::datasource::listing::FileRange;
 use crate::datasource::{listing::PartitionedFile, object_store::ObjectStoreUrl};
+use crate::{config::ConfigOptions, datasource::listing::FileRange};
 use crate::{
     error::{DataFusionError, Result},
     scalar::ScalarValue,
@@ -75,22 +73,35 @@ lazy_static! {
 /// any given file format.
 #[derive(Debug, Clone)]
 pub struct FileScanConfig {
-    /// Object store URL
+    /// Object store URL, used to get an [`ObjectStore`] instance from
+    /// [`RuntimeEnv::object_store`]
     pub object_store_url: ObjectStoreUrl,
-    /// Schema before projection. It contains the columns that are expected
-    /// to be in the files without the table partition columns.
+    /// Schema before `projection` is applied. It contains the all columns that may
+    /// appear in the files. It does not include table partition columns
+    /// that may be added.
     pub file_schema: SchemaRef,
     /// List of files to be processed, grouped into partitions
+    ///
+    /// Each file must have a schema of `file_schema` or a subset. If
+    /// a particular file has a subset, the missing columns are
+    /// padded with with NULLs.
+    ///
+    /// DataFusion may attempt to read each partition of files
+    /// concurrently, however files *within* a partition will be read
+    /// sequentially, one after the next.
     pub file_groups: Vec<Vec<PartitionedFile>>,
     /// Estimated overall statistics of the files, taking `filters` into account.
     pub statistics: Statistics,
     /// Columns on which to project the data. Indexes that are higher than the
     /// number of columns of `file_schema` refer to `table_partition_cols`.
     pub projection: Option<Vec<usize>>,
-    /// The minimum number of records required from this source plan
+    /// The maximum number of records to read from this plan. If None,
+    /// all records after filtering are returned.
     pub limit: Option<usize>,
     /// The partitioning column names
     pub table_partition_cols: Vec<String>,
+    /// Configuration options passed to the physical plans
+    pub config_options: Arc<RwLock<ConfigOptions>>,
 }
 
 impl FileScanConfig {
@@ -413,7 +424,7 @@ pub struct FileMeta {
     pub object_meta: ObjectMeta,
     /// An optional file range for a more fine-grained parallel execution
     pub range: Option<FileRange>,
-    /// An optional field for user defined per object metadata  
+    /// An optional field for user defined per object metadata
     pub extensions: Option<Arc<dyn std::any::Any + Send + Sync>>,
 }
 
@@ -698,6 +709,7 @@ mod tests {
             projection,
             statistics,
             table_partition_cols,
+            config_options: ConfigOptions::new().into_shareable(),
         }
     }
 }

@@ -25,26 +25,22 @@ use arrow::{
 use chrono::prelude::*;
 use chrono::Duration;
 
-use datafusion::assert_batches_eq;
-use datafusion::assert_batches_sorted_eq;
-use datafusion::assert_contains;
-use datafusion::assert_not_contains;
 use datafusion::datasource::TableProvider;
 use datafusion::from_slice::FromSlice;
-use datafusion::logical_plan::plan::{Aggregate, Projection};
-use datafusion::logical_plan::LogicalPlan;
-use datafusion::logical_plan::TableScan;
+use datafusion::logical_expr::{Aggregate, LogicalPlan, Projection, TableScan};
 use datafusion::physical_plan::metrics::MetricValue;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::ExecutionPlanVisitor;
 use datafusion::prelude::*;
 use datafusion::test_util;
+use datafusion::{assert_batches_eq, assert_batches_sorted_eq};
 use datafusion::{datasource::MemTable, physical_plan::collect};
 use datafusion::{
     error::{DataFusionError, Result},
     physical_plan::ColumnarValue,
 };
 use datafusion::{execution::context::SessionContext, physical_plan::displayable};
+use datafusion_common::{assert_contains, assert_not_contains};
 use datafusion_expr::Volatility;
 use object_store::path::Path;
 use std::fs::File;
@@ -113,6 +109,7 @@ pub mod idenfifers;
 pub mod information_schema;
 pub mod parquet_schema;
 pub mod partitioned_csv;
+pub mod set_variable;
 pub mod subqueries;
 #[cfg(feature = "unicode_expressions")]
 pub mod unicode;
@@ -138,8 +135,7 @@ where
         });
 }
 
-#[allow(clippy::unnecessary_wraps)]
-fn create_ctx() -> Result<SessionContext> {
+fn create_ctx() -> SessionContext {
     let mut ctx = SessionContext::new();
 
     // register a custom UDF
@@ -151,7 +147,7 @@ fn create_ctx() -> Result<SessionContext> {
         Arc::new(custom_sqrt),
     ));
 
-    Ok(ctx)
+    ctx
 }
 
 fn custom_sqrt(args: &[ColumnarValue]) -> Result<ColumnarValue> {
@@ -196,14 +192,14 @@ fn create_join_context(column_left: &str, column_right: &str) -> Result<SessionC
     let t1_data = RecordBatch::try_new(
         t1_schema,
         vec![
-            Arc::new(UInt32Array::from_slice(&[11, 22, 33, 44])),
+            Arc::new(UInt32Array::from_slice([11, 22, 33, 44])),
             Arc::new(StringArray::from(vec![
                 Some("a"),
                 Some("b"),
                 Some("c"),
                 Some("d"),
             ])),
-            Arc::new(UInt32Array::from_slice(&[1, 2, 3, 4])),
+            Arc::new(UInt32Array::from_slice([1, 2, 3, 4])),
         ],
     )?;
     ctx.register_batch("t1", t1_data)?;
@@ -216,14 +212,14 @@ fn create_join_context(column_left: &str, column_right: &str) -> Result<SessionC
     let t2_data = RecordBatch::try_new(
         t2_schema,
         vec![
-            Arc::new(UInt32Array::from_slice(&[11, 22, 44, 55])),
+            Arc::new(UInt32Array::from_slice([11, 22, 44, 55])),
             Arc::new(StringArray::from(vec![
                 Some("z"),
                 Some("y"),
                 Some("x"),
                 Some("w"),
             ])),
-            Arc::new(UInt32Array::from_slice(&[3, 1, 3, 3])),
+            Arc::new(UInt32Array::from_slice([3, 1, 3, 3])),
         ],
     )?;
     ctx.register_batch("t2", t2_data)?;
@@ -245,9 +241,9 @@ fn create_join_context_qualified(
     let t1_data = RecordBatch::try_new(
         t1_schema,
         vec![
-            Arc::new(UInt32Array::from_slice(&[1, 2, 3, 4])),
-            Arc::new(UInt32Array::from_slice(&[10, 20, 30, 40])),
-            Arc::new(UInt32Array::from_slice(&[50, 60, 70, 80])),
+            Arc::new(UInt32Array::from_slice([1, 2, 3, 4])),
+            Arc::new(UInt32Array::from_slice([10, 20, 30, 40])),
+            Arc::new(UInt32Array::from_slice([50, 60, 70, 80])),
         ],
     )?;
     ctx.register_batch(left_name, t1_data)?;
@@ -260,9 +256,9 @@ fn create_join_context_qualified(
     let t2_data = RecordBatch::try_new(
         t2_schema,
         vec![
-            Arc::new(UInt32Array::from_slice(&[1, 2, 9, 4])),
-            Arc::new(UInt32Array::from_slice(&[100, 200, 300, 400])),
-            Arc::new(UInt32Array::from_slice(&[500, 600, 700, 800])),
+            Arc::new(UInt32Array::from_slice([1, 2, 9, 4])),
+            Arc::new(UInt32Array::from_slice([100, 200, 300, 400])),
+            Arc::new(UInt32Array::from_slice([500, 600, 700, 800])),
         ],
     )?;
     ctx.register_batch(right_name, t2_data)?;
@@ -354,7 +350,7 @@ fn create_join_context_unbalanced(
     let t1_data = RecordBatch::try_new(
         t1_schema,
         vec![
-            Arc::new(UInt32Array::from_slice(&[11, 22, 33, 44, 77])),
+            Arc::new(UInt32Array::from_slice([11, 22, 33, 44, 77])),
             Arc::new(StringArray::from(vec![
                 Some("a"),
                 Some("b"),
@@ -373,7 +369,7 @@ fn create_join_context_unbalanced(
     let t2_data = RecordBatch::try_new(
         t2_schema,
         vec![
-            Arc::new(UInt32Array::from_slice(&[11, 22, 44, 55])),
+            Arc::new(UInt32Array::from_slice([11, 22, 44, 55])),
             Arc::new(StringArray::from(vec![
                 Some("z"),
                 Some("y"),
@@ -562,9 +558,9 @@ async fn register_tpch_csv_data(
             DataType::Int64 => {
                 cols.push(Box::new(Int64Builder::with_capacity(records.len())))
             }
-            DataType::Decimal128(p, s) => cols.push(Box::new(
-                Decimal128Builder::with_capacity(records.len(), *p, *s),
-            )),
+            DataType::Decimal128(_, _) => {
+                cols.push(Box::new(Decimal128Builder::with_capacity(records.len())))
+            }
             _ => {
                 let msg = format!("Not implemented: {}", field.data_type());
                 Err(DataFusionError::Plan(msg))?
@@ -602,7 +598,7 @@ async fn register_tpch_csv_data(
                         .unwrap();
                     let val = val.trim().replace('.', "");
                     let value_i128 = val.parse::<i128>().unwrap();
-                    sb.append_value(value_i128)?;
+                    sb.append_value(value_i128);
                 }
                 _ => Err(DataFusionError::Plan(format!(
                     "Not implemented: {}",
@@ -611,7 +607,21 @@ async fn register_tpch_csv_data(
             }
         }
     }
-    let cols: Vec<ArrayRef> = cols.iter_mut().map(|it| it.finish()).collect();
+    let cols: Vec<ArrayRef> = cols
+        .iter_mut()
+        .zip(schema.fields())
+        .map(|(it, field)| match field.data_type() {
+            DataType::Decimal128(p, s) => Arc::new(
+                it.as_any_mut()
+                    .downcast_mut::<Decimal128Builder>()
+                    .unwrap()
+                    .finish()
+                    .with_precision_and_scale(*p, *s)
+                    .unwrap(),
+            ),
+            _ => it.finish(),
+        })
+        .collect();
 
     let batch = RecordBatch::try_new(Arc::clone(&schema), cols)?;
 
@@ -881,14 +891,17 @@ pub fn table_with_decimal() -> Arc<dyn TableProvider> {
 }
 
 fn make_decimal() -> RecordBatch {
-    let mut decimal_builder = Decimal128Builder::with_capacity(20, 10, 3);
+    let mut decimal_builder = Decimal128Builder::with_capacity(20);
     for i in 110000..110010 {
-        decimal_builder.append_value(i as i128).unwrap();
+        decimal_builder.append_value(i as i128);
     }
     for i in 100000..100010 {
-        decimal_builder.append_value(-i as i128).unwrap();
+        decimal_builder.append_value(-i as i128);
     }
-    let array = decimal_builder.finish();
+    let array = decimal_builder
+        .finish()
+        .with_precision_and_scale(10, 3)
+        .unwrap();
     let schema = Schema::new(vec![Field::new("c1", array.data_type().clone(), true)]);
     RecordBatch::try_new(Arc::new(schema), vec![Arc::new(array)]).unwrap()
 }
@@ -970,14 +983,14 @@ async fn register_alltypes_parquet(ctx: &SessionContext) {
 
 fn make_timestamp_table<A>() -> Result<Arc<MemTable>>
 where
-    A: ArrowTimestampType,
+    A: ArrowTimestampType<Native = i64>,
 {
     make_timestamp_tz_table::<A>(None)
 }
 
 fn make_timestamp_tz_table<A>(tz: Option<String>) -> Result<Arc<MemTable>>
 where
-    A: ArrowTimestampType,
+    A: ArrowTimestampType<Native = i64>,
 {
     let schema = Arc::new(Schema::new(vec![
         Field::new(
@@ -1001,7 +1014,7 @@ where
         1599565349190855000 / divisor,    // 2020-09-08T11:42:29.190855+00:00
     ]; // 2020-09-08T11:42:29.190855+00:00
 
-    let array = PrimitiveArray::<A>::from_vec(timestamps, tz);
+    let array = PrimitiveArray::<A>::from_iter_values(timestamps).with_timezone_opt(tz);
 
     let data = RecordBatch::try_new(
         schema.clone(),
@@ -1139,10 +1152,10 @@ pub fn make_timestamps() -> RecordBatch {
         .map(|(i, _)| format!("Row {}", i))
         .collect::<Vec<_>>();
 
-    let arr_nanos = TimestampNanosecondArray::from_opt_vec(ts_nanos, None);
-    let arr_micros = TimestampMicrosecondArray::from_opt_vec(ts_micros, None);
-    let arr_millis = TimestampMillisecondArray::from_opt_vec(ts_millis, None);
-    let arr_secs = TimestampSecondArray::from_opt_vec(ts_secs, None);
+    let arr_nanos = TimestampNanosecondArray::from(ts_nanos);
+    let arr_micros = TimestampMicrosecondArray::from(ts_micros);
+    let arr_millis = TimestampMillisecondArray::from(ts_millis);
+    let arr_secs = TimestampSecondArray::from(ts_secs);
 
     let names = names.iter().map(|s| s.as_str()).collect::<Vec<_>>();
     let arr_names = StringArray::from(names);

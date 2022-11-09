@@ -21,18 +21,25 @@ use std::sync::Arc;
 
 use arrow::datatypes::{Schema, SchemaRef};
 
+use crate::datasource::file_format::avro::DEFAULT_AVRO_EXTENSION;
+use crate::datasource::file_format::csv::DEFAULT_CSV_EXTENSION;
+use crate::datasource::file_format::file_type::FileCompressionType;
+use crate::datasource::file_format::json::DEFAULT_JSON_EXTENSION;
+use crate::datasource::file_format::parquet::DEFAULT_PARQUET_EXTENSION;
 use crate::datasource::file_format::DEFAULT_SCHEMA_INFER_MAX_RECORD;
 use crate::datasource::{
     file_format::{
-        avro::{AvroFormat, DEFAULT_AVRO_EXTENSION},
-        csv::{CsvFormat, DEFAULT_CSV_EXTENSION},
-        json::{JsonFormat, DEFAULT_JSON_EXTENSION},
-        parquet::{ParquetFormat, DEFAULT_PARQUET_EXTENSION},
+        avro::AvroFormat, csv::CsvFormat, json::JsonFormat, parquet::ParquetFormat,
     },
     listing::ListingOptions,
 };
 
-/// CSV file read option
+/// Options that control the reading of CSV files.
+///
+/// Note this structure is supplied when a datasource is created and
+/// can not not vary from statement to statement. For settings that
+/// can vary statement to statement see
+/// [`ConfigOptions`](crate::config::ConfigOptions).
 #[derive(Clone)]
 pub struct CsvReadOptions<'a> {
     /// Does the CSV file have a header?
@@ -48,10 +55,13 @@ pub struct CsvReadOptions<'a> {
     /// Max number of rows to read from CSV files for schema inference if needed. Defaults to `DEFAULT_SCHEMA_INFER_MAX_RECORD`.
     pub schema_infer_max_records: usize,
     /// File extension; only files with this extension are selected for data input.
-    /// Defaults to DEFAULT_CSV_EXTENSION.
+    /// Defaults to `FileType::CSV.get_ext().as_str()`.
     pub file_extension: &'a str,
     /// Partition Columns
     pub table_partition_cols: Vec<String>,
+
+    /// File compression type
+    pub file_compression_type: FileCompressionType,
 }
 
 impl<'a> Default for CsvReadOptions<'a> {
@@ -70,6 +80,7 @@ impl<'a> CsvReadOptions<'a> {
             delimiter: b',',
             file_extension: DEFAULT_CSV_EXTENSION,
             table_partition_cols: vec![],
+            file_compression_type: FileCompressionType::UNCOMPRESSED,
         }
     }
 
@@ -117,12 +128,22 @@ impl<'a> CsvReadOptions<'a> {
         self
     }
 
+    /// Configure file compression type
+    pub fn file_compression_type(
+        mut self,
+        file_compression_type: FileCompressionType,
+    ) -> Self {
+        self.file_compression_type = file_compression_type;
+        self
+    }
+
     /// Helper to convert these user facing options to `ListingTable` options
     pub fn to_listing_options(&self, target_partitions: usize) -> ListingOptions {
         let file_format = CsvFormat::default()
             .with_has_header(self.has_header)
             .with_delimiter(self.delimiter)
-            .with_schema_infer_max_rec(Some(self.schema_infer_max_records));
+            .with_schema_infer_max_rec(Some(self.schema_infer_max_records))
+            .with_file_compression_type(self.file_compression_type.to_owned());
 
         ListingOptions {
             format: Arc::new(file_format),
@@ -134,7 +155,12 @@ impl<'a> CsvReadOptions<'a> {
     }
 }
 
-/// Parquet read options
+/// Options that control the reading of Parquet files.
+///
+/// Note this structure is supplied when a datasource is created and
+/// can not not vary from statement to statement. For settings that
+/// can vary statement to statement see
+/// [`ConfigOptions`](crate::config::ConfigOptions).
 #[derive(Clone)]
 pub struct ParquetReadOptions<'a> {
     /// File extension; only files with this extension are selected for data input.
@@ -144,16 +170,19 @@ pub struct ParquetReadOptions<'a> {
     pub table_partition_cols: Vec<String>,
     /// Should DataFusion parquet reader use the predicate to prune data,
     /// overridden by value on execution::context::SessionConfig
+    // TODO move this into ConfigOptions
     pub parquet_pruning: bool,
     /// Tell the parquet reader to skip any metadata that may be in
     /// the file Schema. This can help avoid schema conflicts due to
     /// metadata.  Defaults to true.
+    // TODO move this into ConfigOptions
     pub skip_metadata: bool,
 }
 
 impl<'a> Default for ParquetReadOptions<'a> {
     fn default() -> Self {
         let format_default = ParquetFormat::default();
+
         Self {
             file_extension: DEFAULT_PARQUET_EXTENSION,
             table_partition_cols: vec![],
@@ -200,14 +229,19 @@ impl<'a> ParquetReadOptions<'a> {
     }
 }
 
-/// Avro read options
+/// Options that control the reading of AVRO files.
+///
+/// Note this structure is supplied when a datasource is created and
+/// can not not vary from statement to statement. For settings that
+/// can vary statement to statement see
+/// [`ConfigOptions`](crate::config::ConfigOptions).
 #[derive(Clone)]
 pub struct AvroReadOptions<'a> {
     /// The data source schema.
     pub schema: Option<SchemaRef>,
 
     /// File extension; only files with this extension are selected for data input.
-    /// Defaults to DEFAULT_AVRO_EXTENSION.
+    /// Defaults to `FileType::AVRO.get_ext().as_str()`.
     pub file_extension: &'a str,
     /// Partition Columns
     pub table_partition_cols: Vec<String>,
@@ -244,7 +278,12 @@ impl<'a> AvroReadOptions<'a> {
     }
 }
 
-/// Line-delimited JSON read options
+/// Options that control the reading of Line-delimited JSON files (NDJson)
+///
+/// Note this structure is supplied when a datasource is created and
+/// can not not vary from statement to statement. For settings that
+/// can vary statement to statement see
+/// [`ConfigOptions`](crate::config::ConfigOptions).
 #[derive(Clone)]
 pub struct NdJsonReadOptions<'a> {
     /// The data source schema.
@@ -254,10 +293,13 @@ pub struct NdJsonReadOptions<'a> {
     pub schema_infer_max_records: usize,
 
     /// File extension; only files with this extension are selected for data input.
-    /// Defaults to DEFAULT_JSON_EXTENSION.
+    /// Defaults to `FileType::JSON.get_ext().as_str()`.
     pub file_extension: &'a str,
     /// Partition Columns
     pub table_partition_cols: Vec<String>,
+
+    /// File compression type
+    pub file_compression_type: FileCompressionType,
 }
 
 impl<'a> Default for NdJsonReadOptions<'a> {
@@ -267,6 +309,7 @@ impl<'a> Default for NdJsonReadOptions<'a> {
             schema_infer_max_records: DEFAULT_SCHEMA_INFER_MAX_RECORD,
             file_extension: DEFAULT_JSON_EXTENSION,
             table_partition_cols: vec![],
+            file_compression_type: FileCompressionType::UNCOMPRESSED,
         }
     }
 }
@@ -278,9 +321,25 @@ impl<'a> NdJsonReadOptions<'a> {
         self
     }
 
+    /// Specify file_extension
+    pub fn file_extension(mut self, file_extension: &'a str) -> Self {
+        self.file_extension = file_extension;
+        self
+    }
+
+    /// Specify file_compression_type
+    pub fn file_compression_type(
+        mut self,
+        file_compression_type: FileCompressionType,
+    ) -> Self {
+        self.file_compression_type = file_compression_type;
+        self
+    }
+
     /// Helper to convert these user facing options to `ListingTable` options
     pub fn to_listing_options(&self, target_partitions: usize) -> ListingOptions {
-        let file_format = JsonFormat::default();
+        let file_format = JsonFormat::default()
+            .with_file_compression_type(self.file_compression_type.to_owned());
         ListingOptions {
             format: Arc::new(file_format),
             collect_stat: false,

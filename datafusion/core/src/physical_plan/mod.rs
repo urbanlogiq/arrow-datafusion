@@ -22,8 +22,9 @@ use self::metrics::MetricsSet;
 use self::{
     coalesce_partitions::CoalescePartitionsExec, display::DisplayableExecutionPlan,
 };
+pub use crate::common::{ColumnStatistics, Statistics};
+use crate::error::Result;
 use crate::physical_plan::expressions::PhysicalSortExpr;
-use crate::{error::Result, scalar::ScalarValue};
 
 use arrow::datatypes::SchemaRef;
 use arrow::error::Result as ArrowResult;
@@ -88,36 +89,6 @@ impl Stream for EmptyRecordBatchStream {
 /// Physical planner interface
 pub use self::planner::PhysicalPlanner;
 
-/// Statistics for a physical plan node
-/// Fields are optional and can be inexact because the sources
-/// sometimes provide approximate estimates for performance reasons
-/// and the transformations output are not always predictable.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Statistics {
-    /// The number of table rows
-    pub num_rows: Option<usize>,
-    /// total bytes of the table rows
-    pub total_byte_size: Option<usize>,
-    /// Statistics on a column level
-    pub column_statistics: Option<Vec<ColumnStatistics>>,
-    /// If true, any field that is `Some(..)` is the actual value in the data provided by the operator (it is not
-    /// an estimate). Any or all other fields might still be None, in which case no information is known.
-    /// if false, any field that is `Some(..)` may contain an inexact estimate and may not be the actual value.
-    pub is_exact: bool,
-}
-/// This table statistics are estimates about column
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct ColumnStatistics {
-    /// Number of null values on column
-    pub null_count: Option<usize>,
-    /// Maximum value of column
-    pub max_value: Option<ScalarValue>,
-    /// Minimum value of column
-    pub min_value: Option<ScalarValue>,
-    /// Number of distinct values
-    pub distinct_count: Option<usize>,
-}
-
 /// `ExecutionPlan` represent nodes in the DataFusion Physical Plan.
 ///
 /// Each `ExecutionPlan` is partition-aware and is responsible for
@@ -151,10 +122,20 @@ pub trait ExecutionPlan: Debug + Send + Sync {
     /// have any particular output order here
     fn output_ordering(&self) -> Option<&[PhysicalSortExpr]>;
 
-    /// Specifies the data distribution requirements of all the
-    /// children for this operator
-    fn required_child_distribution(&self) -> Distribution {
-        Distribution::UnspecifiedDistribution
+    /// Specifies the data distribution requirements for all the
+    /// children for this operator, By default it's [[Distribution::UnspecifiedDistribution]] for each child,
+    fn required_input_distribution(&self) -> Vec<Distribution> {
+        if !self.children().is_empty() {
+            vec![Distribution::UnspecifiedDistribution; self.children().len()]
+        } else {
+            vec![Distribution::UnspecifiedDistribution]
+        }
+    }
+
+    /// Specifies the ordering requirements for all the
+    /// children for this operator.
+    fn required_input_ordering(&self) -> Vec<Option<&[PhysicalSortExpr]>> {
+        vec![None; self.children().len()]
     }
 
     /// Returns `true` if this operator relies on its inputs being
@@ -165,13 +146,17 @@ pub trait ExecutionPlan: Debug + Send + Sync {
     /// optimizations which might reorder the inputs (such as
     /// repartitioning to increase concurrency).
     ///
-    /// The default implementation returns `true`
+    /// The default implementation checks the input ordering requirements
+    /// and if there is non empty ordering requirements to the input, the method will
+    /// return `true`.
     ///
     /// WARNING: if you override this default and return `false`, your
     /// operator can not rely on DataFusion preserving the input order
     /// as it will likely not.
     fn relies_on_input_order(&self) -> bool {
-        true
+        self.required_input_ordering()
+            .iter()
+            .any(|ordering| matches!(ordering, Some(_)))
     }
 
     /// Returns `false` if this operator's implementation may reorder
@@ -204,10 +189,15 @@ pub trait ExecutionPlan: Debug + Send + Sync {
     fn benefits_from_input_partitioning(&self) -> bool {
         // By default try to maximize parallelism with more CPUs if
         // possible
-        !matches!(
-            self.required_child_distribution(),
-            Distribution::SinglePartition
-        )
+        !self
+            .required_input_distribution()
+            .into_iter()
+            .any(|dist| matches!(dist, Distribution::SinglePartition))
+    }
+
+    /// Get the EquivalenceProperties within the plan
+    fn equivalence_properties(&self) -> EquivalenceProperties {
+        EquivalenceProperties::new()
     }
 
     /// Get a list of child execution plans that provide the input for this plan. The returned list
@@ -489,6 +479,23 @@ impl Partitioning {
     }
 }
 
+impl PartialEq for Partitioning {
+    fn eq(&self, other: &Partitioning) -> bool {
+        match (self, other) {
+            (
+                Partitioning::RoundRobinBatch(count1),
+                Partitioning::RoundRobinBatch(count2),
+            ) if count1 == count2 => true,
+            (Partitioning::Hash(exprs1, count1), Partitioning::Hash(exprs2, count2))
+                if expr_list_eq_strict_order(exprs1, exprs2) && (count1 == count2) =>
+            {
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
 /// Distribution schemes
 #[derive(Debug, Clone)]
 pub enum Distribution {
@@ -501,7 +508,10 @@ pub enum Distribution {
     HashPartitioned(Vec<Arc<dyn PhysicalExpr>>),
 }
 
+use datafusion_physical_expr::expr_list_eq_strict_order;
+use datafusion_physical_expr::expressions::Column;
 pub use datafusion_physical_expr::window::WindowExpr;
+use datafusion_physical_expr::EquivalenceProperties;
 pub use datafusion_physical_expr::{AggregateExpr, PhysicalExpr};
 
 /// Applies an optional projection to a [`SchemaRef`], returning the
@@ -549,22 +559,18 @@ pub mod analyze;
 pub mod coalesce_batches;
 pub mod coalesce_partitions;
 pub mod common;
-pub mod cross_join;
 pub mod display;
 pub mod empty;
 pub mod explain;
 pub mod file_format;
 pub mod filter;
-pub mod hash_join;
-pub mod hash_utils;
-pub mod join_utils;
+pub mod joins;
 pub mod limit;
 pub mod memory;
 pub mod metrics;
 pub mod planner;
 pub mod projection;
 pub mod repartition;
-pub mod sort_merge_join;
 pub mod sorts;
 pub mod stream;
 pub mod udaf;
@@ -573,4 +579,6 @@ pub mod values;
 pub mod windows;
 
 use crate::execution::context::TaskContext;
-pub use datafusion_physical_expr::{expressions, functions, type_coercion, udf};
+pub use datafusion_physical_expr::{
+    expressions, functions, hash_utils, type_coercion, udf,
+};

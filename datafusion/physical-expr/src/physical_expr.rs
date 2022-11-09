@@ -19,18 +19,19 @@ use arrow::datatypes::{DataType, Schema};
 
 use arrow::record_batch::RecordBatch;
 
-use datafusion_common::Result;
-
+use datafusion_common::{ColumnStatistics, DataFusionError, Result, ScalarValue};
 use datafusion_expr::ColumnarValue;
-use std::fmt::{Debug, Display};
 
 use arrow::array::{make_array, Array, ArrayRef, BooleanArray, MutableArrayData};
 use arrow::compute::{and_kleene, filter_record_batch, is_not_null, SlicesIterator};
+
 use std::any::Any;
+use std::fmt::{Debug, Display};
+use std::sync::Arc;
 
 /// Expression that can be evaluated against a RecordBatch
 /// A Physical expression knows its type, nullability and how to evaluate itself.
-pub trait PhysicalExpr: Send + Sync + Display + Debug {
+pub trait PhysicalExpr: Send + Sync + Display + Debug + PartialEq<dyn Any> {
     /// Returns the physical expression as [`Any`](std::any::Any) so that it can be
     /// downcast to a specific implementation.
     fn as_any(&self) -> &dyn Any;
@@ -60,6 +61,117 @@ pub trait PhysicalExpr: Send + Sync + Display + Debug {
         } else {
             Ok(tmp_result)
         }
+    }
+    /// Return the expression statistics for this expression. This API is currently experimental.
+    fn expr_stats(&self) -> Arc<dyn PhysicalExprStats> {
+        Arc::new(BasicExpressionStats {})
+    }
+    /// Get a list of child PhysicalExpr that provide the input for this expr.
+    fn children(&self) -> Vec<Arc<dyn PhysicalExpr>>;
+
+    /// Returns a new PhysicalExpr where all children were replaced by new exprs.
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn PhysicalExpr>>,
+    ) -> Result<Arc<dyn PhysicalExpr>>;
+}
+
+/// Statistics about the result of a single expression.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ExprBoundaries {
+    /// Maximum value this expression's result can have.
+    pub max_value: ScalarValue,
+    /// Minimum value this expression's result can have.
+    pub min_value: ScalarValue,
+    /// Maximum number of distinct values this expression can produce, if known.
+    pub distinct_count: Option<usize>,
+    /// Selectivity of this expression if it were used as a predicate, as a
+    /// value between 0 and 1.
+    pub selectivity: Option<f64>,
+}
+
+impl ExprBoundaries {
+    /// Create a new `ExprBoundaries`.
+    pub fn new(
+        max_value: ScalarValue,
+        min_value: ScalarValue,
+        distinct_count: Option<usize>,
+    ) -> Self {
+        Self {
+            max_value,
+            min_value,
+            distinct_count,
+            selectivity: None,
+        }
+    }
+
+    /// Try to reduce the expression boundaries to a single value if possible.
+    pub fn reduce(&self) -> Option<ScalarValue> {
+        if self.min_value == self.max_value {
+            Some(self.min_value.clone())
+        } else {
+            None
+        }
+    }
+}
+
+/// A toolkit to work with physical expressions statistics. This API is currently experimental
+/// and might be subject to change.
+pub trait PhysicalExprStats: Send + Sync {
+    /// Return an estimate about the boundaries of this expression's result would have (in
+    /// terms of minimum and maximum values it can take as well the number of unique values
+    /// it can produce). The inputs are the column-level statistics from the current physical
+    /// plan.
+    fn boundaries(&self, columns: &[ColumnStatistics]) -> Option<ExprBoundaries>;
+}
+
+#[derive(Debug, Clone)]
+pub struct BasicExpressionStats {}
+
+/// A dummy implementation of [`ExpressionStats`] that does not provide any statistics.
+impl PhysicalExprStats for BasicExpressionStats {
+    #[allow(unused_variables)]
+    fn boundaries(&self, columns: &[ColumnStatistics]) -> Option<ExprBoundaries> {
+        None
+    }
+}
+
+/// Returns a copy of this expr if we change any child according to the pointer comparison.
+/// The size of `children` must be equal to the size of `PhysicalExpr::children()`.
+/// Allow the vtable address comparisons for PhysicalExpr Trait Objects，it is harmless even
+/// in the case of 'false-native'.
+#[allow(clippy::vtable_address_comparisons)]
+pub fn with_new_children_if_necessary(
+    expr: Arc<dyn PhysicalExpr>,
+    children: Vec<Arc<dyn PhysicalExpr>>,
+) -> Result<Arc<dyn PhysicalExpr>> {
+    if children.len() != expr.children().len() {
+        Err(DataFusionError::Internal(
+            "PhysicalExpr: Wrong number of children".to_string(),
+        ))
+    } else if children.is_empty()
+        || children
+            .iter()
+            .zip(expr.children().iter())
+            .any(|(c1, c2)| !Arc::ptr_eq(c1, c2))
+    {
+        expr.with_new_children(children)
+    } else {
+        Ok(expr)
+    }
+}
+
+pub fn down_cast_any_ref(any: &dyn Any) -> &dyn Any {
+    if any.is::<Arc<dyn PhysicalExpr>>() {
+        any.downcast_ref::<Arc<dyn PhysicalExpr>>()
+            .unwrap()
+            .as_any()
+    } else if any.is::<Box<dyn PhysicalExpr>>() {
+        any.downcast_ref::<Box<dyn PhysicalExpr>>()
+            .unwrap()
+            .as_any()
+    } else {
+        any
     }
 }
 
@@ -112,7 +224,7 @@ mod tests {
 
     use super::*;
     use arrow::array::Int32Array;
-    use datafusion_common::Result;
+    use datafusion_common::{cast::as_int32_array, Result};
 
     #[test]
     fn scatter_int() -> Result<()> {
@@ -123,7 +235,7 @@ mod tests {
         let expected =
             Int32Array::from_iter(vec![Some(1), Some(10), None, None, Some(11)]);
         let result = scatter(&mask, truthy.as_ref())?;
-        let result = result.as_any().downcast_ref::<Int32Array>().unwrap();
+        let result = as_int32_array(&result)?;
 
         assert_eq!(&expected, result);
         Ok(())
@@ -138,7 +250,7 @@ mod tests {
         let expected =
             Int32Array::from_iter(vec![Some(1), None, Some(10), None, None, None]);
         let result = scatter(&mask, truthy.as_ref())?;
-        let result = result.as_any().downcast_ref::<Int32Array>().unwrap();
+        let result = as_int32_array(&result)?;
 
         assert_eq!(&expected, result);
         Ok(())
@@ -154,7 +266,7 @@ mod tests {
         // output should treat nulls as though they are false
         let expected = Int32Array::from_iter(vec![None, None, Some(1), Some(10), None]);
         let result = scatter(&mask, truthy.as_ref())?;
-        let result = result.as_any().downcast_ref::<Int32Array>().unwrap();
+        let result = as_int32_array(&result)?;
 
         assert_eq!(&expected, result);
         Ok(())
@@ -177,6 +289,33 @@ mod tests {
         let result = result.as_any().downcast_ref::<BooleanArray>().unwrap();
 
         assert_eq!(&expected, result);
+        Ok(())
+    }
+
+    #[test]
+    fn reduce_boundaries() -> Result<()> {
+        let different_boundaries = ExprBoundaries::new(
+            ScalarValue::Int32(Some(1)),
+            ScalarValue::Int32(Some(10)),
+            None,
+        );
+        assert_eq!(different_boundaries.reduce(), None);
+
+        let scalar_boundaries = ExprBoundaries::new(
+            ScalarValue::Int32(Some(1)),
+            ScalarValue::Int32(Some(1)),
+            None,
+        );
+        assert_eq!(
+            scalar_boundaries.reduce(),
+            Some(ScalarValue::Int32(Some(1)))
+        );
+
+        // Can still reduce.
+        let no_boundaries =
+            ExprBoundaries::new(ScalarValue::Int32(None), ScalarValue::Int32(None), None);
+        assert_eq!(no_boundaries.reduce(), Some(ScalarValue::Int32(None)));
+
         Ok(())
     }
 }

@@ -166,8 +166,7 @@ impl Metric {
     }
 }
 
-/// A snapshot of the metrics for a particular operator (`dyn
-/// ExecutionPlan`).
+/// A snapshot of the metrics for a particular ([`ExecutionPlan`]).
 #[derive(Default, Debug, Clone)]
 pub struct MetricsSet {
     metrics: Vec<Arc<Metric>>,
@@ -240,6 +239,23 @@ impl MetricsSet {
         iter.for_each(|metric| accum.aggregate(metric.value()));
 
         Some(accum)
+    }
+
+    /// returns the sum of all the metrics with the specified name
+    /// the returned set.
+    pub fn sum_by_name(&self, metric_name: &str) -> Option<MetricValue> {
+        self.sum(|m| match m.value() {
+            MetricValue::Count { name, .. } => name == metric_name,
+            MetricValue::Time { name, .. } => name == metric_name,
+            MetricValue::OutputRows(_) => false,
+            MetricValue::ElapsedCompute(_) => false,
+            MetricValue::SpillCount(_) => false,
+            MetricValue::SpilledBytes(_) => false,
+            MetricValue::CurrentMemoryUsage(_) => false,
+            MetricValue::Gauge { name, .. } => name == metric_name,
+            MetricValue::StartTimestamp(_) => false,
+            MetricValue::EndTimestamp(_) => false,
+        })
     }
 
     /// Returns returns a new derived `MetricsSet` where all metrics
@@ -378,6 +394,16 @@ impl Label {
         let name = name.into();
         let value = value.into();
         Self { name, value }
+    }
+
+    /// Return the name of this label
+    pub fn name(&self) -> &str {
+        self.name.as_ref()
+    }
+
+    /// Return the value of this label
+    pub fn value(&self) -> &str {
+        self.value.as_ref()
     }
 }
 

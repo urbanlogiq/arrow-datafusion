@@ -20,6 +20,7 @@
 use std::borrow::Borrow;
 use std::cmp::{max, Ordering};
 use std::convert::{Infallible, TryInto};
+use std::ops::{Add, Sub};
 use std::str::FromStr;
 use std::{convert::TryFrom, fmt, iter::repeat, sync::Arc};
 
@@ -34,10 +35,12 @@ use arrow::{
         TimestampSecondType, UInt16Type, UInt32Type, UInt64Type, UInt8Type,
         DECIMAL128_MAX_PRECISION,
     },
-    util::decimal::Decimal128,
 };
+use chrono::{Datelike, Duration, NaiveDate, NaiveDateTime};
 use ordered_float::OrderedFloat;
 
+use crate::cast::as_struct_array;
+use crate::delta::shift_months;
 use crate::error::{DataFusionError, Result};
 
 /// Represents a dynamically typed, nullable single value.
@@ -447,6 +450,7 @@ macro_rules! unsigned_subtraction_error {
 macro_rules! impl_op {
     ($LHS:expr, $RHS:expr, $OPERATION:tt) => {
         match ($LHS, $RHS) {
+            // Binary operations on arguments with the same type:
             (
                 ScalarValue::Decimal128(v1, p1, s1),
                 ScalarValue::Decimal128(v2, p2, s2),
@@ -483,33 +487,142 @@ macro_rules! impl_op {
             (ScalarValue::Int8(lhs), ScalarValue::Int8(rhs)) => {
                 primitive_op!(lhs, rhs, Int8, $OPERATION)
             }
-            _ => {
-                impl_distinct_cases_op!($LHS, $RHS, $OPERATION)
+            // Binary operations on arguments with different types:
+            (ScalarValue::Date32(Some(days)), _) => {
+                let value = date32_add(*days, $RHS, get_sign!($OPERATION))?;
+                Ok(ScalarValue::Date32(Some(value)))
             }
+            (ScalarValue::Date64(Some(ms)), _) => {
+                let value = date64_add(*ms, $RHS, get_sign!($OPERATION))?;
+                Ok(ScalarValue::Date64(Some(value)))
+            }
+            (ScalarValue::TimestampSecond(Some(ts_s), zone), _) => {
+                let value = seconds_add(*ts_s, $RHS, get_sign!($OPERATION))?;
+                Ok(ScalarValue::TimestampSecond(Some(value), zone.clone()))
+            }
+            (ScalarValue::TimestampMillisecond(Some(ts_ms), zone), _) => {
+                let value = milliseconds_add(*ts_ms, $RHS, get_sign!($OPERATION))?;
+                Ok(ScalarValue::TimestampMillisecond(Some(value), zone.clone()))
+            }
+            (ScalarValue::TimestampMicrosecond(Some(ts_us), zone), _) => {
+                let value = microseconds_add(*ts_us, $RHS, get_sign!($OPERATION))?;
+                Ok(ScalarValue::TimestampMicrosecond(Some(value), zone.clone()))
+            }
+            (ScalarValue::TimestampNanosecond(Some(ts_ns), zone), _) => {
+                let value = nanoseconds_add(*ts_ns, $RHS, get_sign!($OPERATION))?;
+                Ok(ScalarValue::TimestampNanosecond(Some(value), zone.clone()))
+            }
+            _ => Err(DataFusionError::Internal(format!(
+                "Operator {} is not implemented for types {:?} and {:?}",
+                stringify!($OPERATION),
+                $LHS,
+                $RHS
+            ))),
         }
     };
 }
 
-// If we want a special implementation for an operation this is the place to implement it.
-// For instance, in the future we may want to implement subtraction for dates but not addition.
-// We can implement such special cases here.
-macro_rules! impl_distinct_cases_op {
-    ($LHS:expr, $RHS:expr, +) => {
-        match ($LHS, $RHS) {
-            e => Err(DataFusionError::Internal(format!(
-                "Addition is not implemented for {:?}",
-                e
-            ))),
-        }
+macro_rules! get_sign {
+    (+) => {
+        1
     };
-    ($LHS:expr, $RHS:expr, -) => {
-        match ($LHS, $RHS) {
-            e => Err(DataFusionError::Internal(format!(
-                "Subtraction is not implemented for {:?}",
-                e
-            ))),
-        }
+    (-) => {
+        -1
     };
+}
+
+#[inline]
+pub fn date32_add(days: i32, scalar: &ScalarValue, sign: i32) -> Result<i32> {
+    let epoch = NaiveDate::from_ymd(1970, 1, 1);
+    let prior = epoch.add(Duration::days(days as i64));
+    let posterior = do_date_math(prior, scalar, sign)?;
+    Ok(posterior.sub(epoch).num_days() as i32)
+}
+
+#[inline]
+pub fn date64_add(ms: i64, scalar: &ScalarValue, sign: i32) -> Result<i64> {
+    let epoch = NaiveDate::from_ymd(1970, 1, 1);
+    let prior = epoch.add(Duration::milliseconds(ms));
+    let posterior = do_date_math(prior, scalar, sign)?;
+    Ok(posterior.sub(epoch).num_milliseconds())
+}
+
+#[inline]
+pub fn seconds_add(ts_s: i64, scalar: &ScalarValue, sign: i32) -> Result<i64> {
+    Ok(do_date_time_math(ts_s, 0, scalar, sign)?.timestamp())
+}
+
+#[inline]
+pub fn milliseconds_add(ts_ms: i64, scalar: &ScalarValue, sign: i32) -> Result<i64> {
+    let secs = ts_ms / 1000;
+    let nsecs = ((ts_ms % 1000) * 1_000_000) as u32;
+    Ok(do_date_time_math(secs, nsecs, scalar, sign)?.timestamp_millis())
+}
+
+#[inline]
+pub fn microseconds_add(ts_us: i64, scalar: &ScalarValue, sign: i32) -> Result<i64> {
+    let secs = ts_us / 1_000_000;
+    let nsecs = ((ts_us % 1_000_000) * 1000) as u32;
+    Ok(do_date_time_math(secs, nsecs, scalar, sign)?.timestamp_nanos() / 1000)
+}
+
+#[inline]
+pub fn nanoseconds_add(ts_ns: i64, scalar: &ScalarValue, sign: i32) -> Result<i64> {
+    let secs = ts_ns / 1_000_000_000;
+    let nsecs = (ts_ns % 1_000_000_000) as u32;
+    Ok(do_date_time_math(secs, nsecs, scalar, sign)?.timestamp_nanos())
+}
+
+#[inline]
+fn do_date_time_math(
+    secs: i64,
+    nsecs: u32,
+    scalar: &ScalarValue,
+    sign: i32,
+) -> Result<NaiveDateTime> {
+    let prior = NaiveDateTime::from_timestamp(secs, nsecs);
+    do_date_math(prior, scalar, sign)
+}
+
+fn do_date_math<D>(prior: D, scalar: &ScalarValue, sign: i32) -> Result<D>
+where
+    D: Datelike + Add<Duration, Output = D>,
+{
+    Ok(match scalar {
+        ScalarValue::IntervalDayTime(Some(i)) => add_day_time(prior, *i, sign),
+        ScalarValue::IntervalYearMonth(Some(i)) => shift_months(prior, *i * sign),
+        ScalarValue::IntervalMonthDayNano(Some(i)) => add_m_d_nano(prior, *i, sign),
+        other => Err(DataFusionError::Execution(format!(
+            "DateIntervalExpr does not support non-interval type {:?}",
+            other
+        )))?,
+    })
+}
+
+// Can remove once chrono:0.4.23 is released
+fn add_m_d_nano<D>(prior: D, interval: i128, sign: i32) -> D
+where
+    D: Datelike + Add<Duration, Output = D>,
+{
+    let (months, days, nanos) = IntervalMonthDayNanoType::to_parts(interval);
+    let months = months * sign;
+    let days = days * sign;
+    let nanos = nanos * sign as i64;
+    let a = shift_months(prior, months);
+    let b = a.add(Duration::days(days as i64));
+    b.add(Duration::nanoseconds(nanos))
+}
+
+// Can remove once chrono:0.4.23 is released
+fn add_day_time<D>(prior: D, interval: i64, sign: i32) -> D
+where
+    D: Datelike + Add<Duration, Output = D>,
+{
+    let (days, ms) = IntervalDayTimeType::to_parts(interval);
+    let days = days * sign;
+    let ms = ms * sign;
+    let intermediate = prior.add(Duration::days(days as i64));
+    intermediate.add(Duration::milliseconds(ms as i64))
 }
 
 // manual implementation of `Hash` that uses OrderedFloat to
@@ -1011,6 +1124,43 @@ impl ScalarValue {
             ScalarValue::IntervalMonthDayNano(v) => v.is_none(),
             ScalarValue::Struct(v, _) => v.is_none(),
             ScalarValue::Dictionary(_, v) => v.is_null(),
+        }
+    }
+
+    /// Absolute distance between two numeric values (of the same type). This method will return
+    /// None if either one of the arguments are null. It might also return None if the resulting
+    /// distance is greater than [`usize::MAX`]. If the type is a float, then the distance will be
+    /// rounded to the nearest integer.
+    ///
+    ///
+    /// Note: the datatype itself must support subtraction.
+    pub fn distance(&self, other: &ScalarValue) -> Option<usize> {
+        // Having an explicit null check here is important because the
+        // subtraction for scalar values will return a real value even
+        // if one side is null.
+        if self.is_null() || other.is_null() {
+            return None;
+        }
+
+        let distance = if self > other {
+            self.sub(other).ok()?
+        } else {
+            other.sub(self).ok()?
+        };
+
+        match distance {
+            ScalarValue::Int8(Some(v)) => usize::try_from(v).ok(),
+            ScalarValue::Int16(Some(v)) => usize::try_from(v).ok(),
+            ScalarValue::Int32(Some(v)) => usize::try_from(v).ok(),
+            ScalarValue::Int64(Some(v)) => usize::try_from(v).ok(),
+            ScalarValue::UInt8(Some(v)) => Some(v as usize),
+            ScalarValue::UInt16(Some(v)) => Some(v as usize),
+            ScalarValue::UInt32(Some(v)) => usize::try_from(v).ok(),
+            ScalarValue::UInt64(Some(v)) => usize::try_from(v).ok(),
+            // TODO: we might want to look into supporting ceil/floor here for floats.
+            ScalarValue::Float32(Some(v)) => Some(v.round() as usize),
+            ScalarValue::Float64(Some(v)) => Some(v.round() as usize),
+            _ => None,
         }
     }
 
@@ -1738,7 +1888,7 @@ impl ScalarValue {
         if array.is_null(index) {
             ScalarValue::Decimal128(None, precision, scale)
         } else {
-            ScalarValue::Decimal128(Some(array.value(index).as_i128()), precision, scale)
+            ScalarValue::Decimal128(Some(array.value(index)), precision, scale)
         }
     }
 
@@ -1861,15 +2011,7 @@ impl ScalarValue {
                 Self::Dictionary(key_type.clone(), Box::new(value))
             }
             DataType::Struct(fields) => {
-                let array =
-                    array
-                        .as_any()
-                        .downcast_ref::<StructArray>()
-                        .ok_or_else(|| {
-                            DataFusionError::Internal(
-                                "Failed to downcast ArrayRef to StructArray".to_string(),
-                            )
-                        })?;
+                let array = as_struct_array(array)?;
                 let mut field_values: Vec<ScalarValue> = Vec::new();
                 for col_index in 0..array.num_columns() {
                     let col_array = array.column(col_index);
@@ -1940,11 +2082,7 @@ impl ScalarValue {
         }
         match value {
             None => array.is_null(index),
-            Some(v) => {
-                !array.is_null(index)
-                    && array.value(index)
-                        == Decimal128::new(precision, scale, &v.to_le_bytes())
-            }
+            Some(v) => !array.is_null(index) && array.value(index) == *v,
         }
     }
 
@@ -2208,6 +2346,15 @@ impl_try_from!(Float32, f32);
 impl_try_from!(Float64, f64);
 impl_try_from!(Boolean, bool);
 
+impl TryFrom<DataType> for ScalarValue {
+    type Error = DataFusionError;
+
+    /// Create a Null instance of ScalarValue for this datatype
+    fn try_from(datatype: DataType) -> Result<Self> {
+        (&datatype).try_into()
+    }
+}
+
 impl TryFrom<&DataType> for ScalarValue {
     type Error = DataFusionError;
 
@@ -2230,6 +2377,9 @@ impl TryFrom<&DataType> for ScalarValue {
             }
             DataType::Utf8 => ScalarValue::Utf8(None),
             DataType::LargeUtf8 => ScalarValue::LargeUtf8(None),
+            DataType::Binary => ScalarValue::Binary(None),
+            DataType::FixedSizeBinary(len) => ScalarValue::FixedSizeBinary(*len, None),
+            DataType::LargeBinary => ScalarValue::LargeBinary(None),
             DataType::Date32 => ScalarValue::Date32(None),
             DataType::Date64 => ScalarValue::Date64(None),
             DataType::Time64(TimeUnit::Nanosecond) => ScalarValue::Time64(None),
@@ -2244,6 +2394,15 @@ impl TryFrom<&DataType> for ScalarValue {
             }
             DataType::Timestamp(TimeUnit::Nanosecond, tz_opt) => {
                 ScalarValue::TimestampNanosecond(None, tz_opt.clone())
+            }
+            DataType::Interval(IntervalUnit::YearMonth) => {
+                ScalarValue::IntervalYearMonth(None)
+            }
+            DataType::Interval(IntervalUnit::DayTime) => {
+                ScalarValue::IntervalDayTime(None)
+            }
+            DataType::Interval(IntervalUnit::MonthDayNano) => {
+                ScalarValue::IntervalMonthDayNano(None)
             }
             DataType::Dictionary(index_type, value_type) => ScalarValue::Dictionary(
                 index_type.clone(),
@@ -2266,44 +2425,6 @@ impl TryFrom<&DataType> for ScalarValue {
         })
     }
 }
-
-// TODO: Remove these coercions once the hardcoded "u64" offset is changed to a
-//       ScalarValue in WindowFrameBound.
-pub trait TryFromValue<T> {
-    fn try_from_value(datatype: &DataType, value: T) -> Result<ScalarValue>;
-}
-
-macro_rules! impl_try_from_value {
-    ($NATIVE:ty, [$([$SCALAR:ident, $PRIMITIVE:ty]),+]) => {
-        impl TryFromValue<$NATIVE> for ScalarValue {
-            fn try_from_value(datatype: &DataType, value: $NATIVE) -> Result<ScalarValue> {
-                match datatype {
-                    $(DataType::$SCALAR => Ok(ScalarValue::$SCALAR(Some(value as $PRIMITIVE))),)+
-                    _ => {
-                        let msg = format!("Can't create a scalar from data_type \"{:?}\"", datatype);
-                        Err(DataFusionError::NotImplemented(msg))
-                    }
-                }
-            }
-        }
-    };
-}
-
-impl_try_from_value!(
-    u64,
-    [
-        [Float64, f64],
-        [Float32, f32],
-        [UInt64, u64],
-        [UInt32, u32],
-        [UInt16, u16],
-        [UInt8, u8],
-        [Int64, i64],
-        [Int32, i32],
-        [Int16, i16],
-        [Int8, i8]
-    ]
-);
 
 macro_rules! format_option {
     ($F:expr, $EXPR:expr) => {{
@@ -2581,15 +2702,15 @@ mod tests {
         let array = array.as_any().downcast_ref::<Decimal128Array>().unwrap();
         assert_eq!(1, array.len());
         assert_eq!(DataType::Decimal128(10, 1), array.data_type().clone());
-        assert_eq!(123i128, array.value(0).as_i128());
+        assert_eq!(123i128, array.value(0));
 
         // decimal scalar to array with size
         let array = decimal_value.to_array_of_size(10);
         let array_decimal = array.as_any().downcast_ref::<Decimal128Array>().unwrap();
         assert_eq!(10, array.len());
         assert_eq!(DataType::Decimal128(10, 1), array.data_type().clone());
-        assert_eq!(123i128, array_decimal.value(0).as_i128());
-        assert_eq!(123i128, array_decimal.value(9).as_i128());
+        assert_eq!(123i128, array_decimal.value(0));
+        assert_eq!(123i128, array_decimal.value(9));
         // test eq array
         assert!(decimal_value.eq_array(&array, 1));
         assert!(decimal_value.eq_array(&array, 5));
@@ -3314,26 +3435,26 @@ mod tests {
         let expected = Arc::new(StructArray::from(vec![
             (
                 field_a.clone(),
-                Arc::new(Int32Array::from_slice(&[23, 23])) as ArrayRef,
+                Arc::new(Int32Array::from_slice([23, 23])) as ArrayRef,
             ),
             (
                 field_b.clone(),
-                Arc::new(BooleanArray::from_slice(&[false, false])) as ArrayRef,
+                Arc::new(BooleanArray::from_slice([false, false])) as ArrayRef,
             ),
             (
                 field_c.clone(),
-                Arc::new(StringArray::from_slice(&["Hello", "Hello"])) as ArrayRef,
+                Arc::new(StringArray::from_slice(["Hello", "Hello"])) as ArrayRef,
             ),
             (
                 field_d.clone(),
                 Arc::new(StructArray::from(vec![
                     (
                         field_e.clone(),
-                        Arc::new(Int16Array::from_slice(&[2, 2])) as ArrayRef,
+                        Arc::new(Int16Array::from_slice([2, 2])) as ArrayRef,
                     ),
                     (
                         field_f.clone(),
-                        Arc::new(Int64Array::from_slice(&[3, 3])) as ArrayRef,
+                        Arc::new(Int64Array::from_slice([3, 3])) as ArrayRef,
                     ),
                 ])) as ArrayRef,
             ),
@@ -3409,15 +3530,15 @@ mod tests {
         let expected = Arc::new(StructArray::from(vec![
             (
                 field_a,
-                Arc::new(Int32Array::from_slice(&[23, 7, -1000])) as ArrayRef,
+                Arc::new(Int32Array::from_slice([23, 7, -1000])) as ArrayRef,
             ),
             (
                 field_b,
-                Arc::new(BooleanArray::from_slice(&[false, true, true])) as ArrayRef,
+                Arc::new(BooleanArray::from_slice([false, true, true])) as ArrayRef,
             ),
             (
                 field_c,
-                Arc::new(StringArray::from_slice(&["Hello", "World", "!!!!!"]))
+                Arc::new(StringArray::from_slice(["Hello", "World", "!!!!!"]))
                     as ArrayRef,
             ),
             (
@@ -3425,11 +3546,11 @@ mod tests {
                 Arc::new(StructArray::from(vec![
                     (
                         field_e,
-                        Arc::new(Int16Array::from_slice(&[2, 4, 6])) as ArrayRef,
+                        Arc::new(Int16Array::from_slice([2, 4, 6])) as ArrayRef,
                     ),
                     (
                         field_f,
-                        Arc::new(Int64Array::from_slice(&[3, 5, 7])) as ArrayRef,
+                        Arc::new(Int64Array::from_slice([3, 5, 7])) as ArrayRef,
                     ),
                 ])) as ArrayRef,
             ),
@@ -3486,12 +3607,11 @@ mod tests {
         // iter_to_array for struct scalars
         let array =
             ScalarValue::iter_to_array(vec![s0.clone(), s1.clone(), s2.clone()]).unwrap();
-        let array = array.as_any().downcast_ref::<StructArray>().unwrap();
-
+        let array = as_struct_array(&array).unwrap();
         let expected = StructArray::from(vec![
             (
                 field_a.clone(),
-                Arc::new(StringArray::from_slice(&["First", "Second", "Third"]))
+                Arc::new(StringArray::from_slice(["First", "Second", "Third"]))
                     as ArrayRef,
             ),
             (
@@ -3802,7 +3922,7 @@ mod tests {
                 match lhs.$FUNCTION(&rhs) {
                     Ok(_result) => {
                         panic!(
-                            "Expected summation error between lhs: '{:?}', rhs: {:?}",
+                            "Expected binary operation error between lhs: '{:?}', rhs: {:?}",
                             lhs, rhs
                         );
                     }
@@ -3820,8 +3940,8 @@ mod tests {
         };
     }
 
-    expect_operation_error!(expect_add_error, add, "Addition is not implemented");
-    expect_operation_error!(expect_sub_error, sub, "Subtraction is not implemented");
+    expect_operation_error!(expect_add_error, add, "Operator + is not implemented");
+    expect_operation_error!(expect_sub_error, sub, "Operator - is not implemented");
 
     macro_rules! decimal_op_test_cases {
     ($OPERATION:ident, [$([$L_VALUE:expr, $L_PRECISION:expr, $L_SCALE:expr, $R_VALUE:expr, $R_PRECISION:expr, $R_SCALE:expr, $O_VALUE:expr, $O_PRECISION:expr, $O_SCALE:expr]),+]) => {
@@ -3889,5 +4009,155 @@ mod tests {
                 [None, 10, 3, Some(123), 8, 4, Some(123), 10, 4]
             ]
         );
+    }
+
+    #[test]
+    fn test_scalar_distance() {
+        let cases = [
+            // scalar (lhs), scalar (rhs), expected distance
+            // ---------------------------------------------
+            (ScalarValue::Int8(Some(1)), ScalarValue::Int8(Some(2)), 1),
+            (ScalarValue::Int8(Some(2)), ScalarValue::Int8(Some(1)), 1),
+            (
+                ScalarValue::Int16(Some(-5)),
+                ScalarValue::Int16(Some(5)),
+                10,
+            ),
+            (
+                ScalarValue::Int16(Some(5)),
+                ScalarValue::Int16(Some(-5)),
+                10,
+            ),
+            (ScalarValue::Int32(Some(0)), ScalarValue::Int32(Some(0)), 0),
+            (
+                ScalarValue::Int32(Some(-5)),
+                ScalarValue::Int32(Some(-10)),
+                5,
+            ),
+            (
+                ScalarValue::Int64(Some(-10)),
+                ScalarValue::Int64(Some(-5)),
+                5,
+            ),
+            (ScalarValue::UInt8(Some(1)), ScalarValue::UInt8(Some(2)), 1),
+            (ScalarValue::UInt8(Some(0)), ScalarValue::UInt8(Some(0)), 0),
+            (
+                ScalarValue::UInt16(Some(5)),
+                ScalarValue::UInt16(Some(10)),
+                5,
+            ),
+            (
+                ScalarValue::UInt32(Some(10)),
+                ScalarValue::UInt32(Some(5)),
+                5,
+            ),
+            (
+                ScalarValue::UInt64(Some(5)),
+                ScalarValue::UInt64(Some(10)),
+                5,
+            ),
+            (
+                ScalarValue::Float32(Some(1.0)),
+                ScalarValue::Float32(Some(2.0)),
+                1,
+            ),
+            (
+                ScalarValue::Float32(Some(2.0)),
+                ScalarValue::Float32(Some(1.0)),
+                1,
+            ),
+            (
+                ScalarValue::Float64(Some(0.0)),
+                ScalarValue::Float64(Some(0.0)),
+                0,
+            ),
+            (
+                ScalarValue::Float64(Some(-5.0)),
+                ScalarValue::Float64(Some(-10.0)),
+                5,
+            ),
+            (
+                ScalarValue::Float64(Some(-10.0)),
+                ScalarValue::Float64(Some(-5.0)),
+                5,
+            ),
+            // Floats are currently special cased to f64/f32 and the result is rounded
+            // rather than ceiled/floored. In the future we might want to take a mode
+            // which specified the rounding behavior.
+            (
+                ScalarValue::Float32(Some(1.2)),
+                ScalarValue::Float32(Some(1.3)),
+                0,
+            ),
+            (
+                ScalarValue::Float32(Some(1.1)),
+                ScalarValue::Float32(Some(1.9)),
+                1,
+            ),
+            (
+                ScalarValue::Float64(Some(-5.3)),
+                ScalarValue::Float64(Some(-9.2)),
+                4,
+            ),
+            (
+                ScalarValue::Float64(Some(-5.3)),
+                ScalarValue::Float64(Some(-9.7)),
+                4,
+            ),
+            (
+                ScalarValue::Float64(Some(-5.3)),
+                ScalarValue::Float64(Some(-9.9)),
+                5,
+            ),
+        ];
+        for (lhs, rhs, expected) in cases.iter() {
+            let distance = lhs.distance(rhs).unwrap();
+            assert_eq!(distance, *expected);
+        }
+    }
+
+    #[test]
+    fn test_scalar_distance_invalid() {
+        let cases = [
+            // scalar (lhs), scalar (rhs)
+            // --------------------------
+            // Same type but with nulls
+            (ScalarValue::Int8(None), ScalarValue::Int8(None)),
+            (ScalarValue::Int8(None), ScalarValue::Int8(Some(1))),
+            (ScalarValue::Int8(Some(1)), ScalarValue::Int8(None)),
+            // Different type
+            (ScalarValue::Int8(Some(1)), ScalarValue::Int16(Some(1))),
+            (ScalarValue::Int8(Some(1)), ScalarValue::Float32(Some(1.0))),
+            (
+                ScalarValue::Float64(Some(1.1)),
+                ScalarValue::Float32(Some(2.2)),
+            ),
+            (
+                ScalarValue::UInt64(Some(777)),
+                ScalarValue::Int32(Some(111)),
+            ),
+            // Different types with nulls
+            (ScalarValue::Int8(None), ScalarValue::Int16(Some(1))),
+            (ScalarValue::Int8(Some(1)), ScalarValue::Int16(None)),
+            // Unsupported types
+            (
+                ScalarValue::Utf8(Some("foo".to_string())),
+                ScalarValue::Utf8(Some("bar".to_string())),
+            ),
+            (
+                ScalarValue::Boolean(Some(true)),
+                ScalarValue::Boolean(Some(false)),
+            ),
+            (ScalarValue::Date32(Some(0)), ScalarValue::Date32(Some(1))),
+            (ScalarValue::Date64(Some(0)), ScalarValue::Date64(Some(1))),
+            (
+                ScalarValue::Decimal128(Some(123), 5, 5),
+                ScalarValue::Decimal128(Some(120), 5, 5),
+            ),
+        ];
+        for (lhs, rhs) in cases {
+            let distance = lhs.distance(&rhs);
+            assert!(distance.is_none());
+        }
     }
 }

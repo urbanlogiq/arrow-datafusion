@@ -18,12 +18,14 @@
 //! Unwrap-cast binary comparison rule can be used to the binary/inlist comparison expr now, and other type
 //! of expr can be added if needed.
 //! This rule can reduce adding the `Expr::Cast` the expr instead of adding the `Expr::Cast` to literal expr.
+use crate::utils::rewrite_preserving_name;
 use crate::{OptimizerConfig, OptimizerRule};
 use arrow::datatypes::{
     DataType, MAX_DECIMAL_FOR_EACH_PRECISION, MIN_DECIMAL_FOR_EACH_PRECISION,
 };
 use datafusion_common::{DFSchema, DFSchemaRef, DataFusionError, Result, ScalarValue};
-use datafusion_expr::expr_rewriter::{ExprRewritable, ExprRewriter, RewriteRecursion};
+use datafusion_expr::expr::{BinaryExpr, Cast};
+use datafusion_expr::expr_rewriter::{ExprRewriter, RewriteRecursion};
 use datafusion_expr::utils::from_plan;
 use datafusion_expr::{
     binary_expr, in_list, lit, Expr, ExprSchemable, LogicalPlan, Operator,
@@ -97,45 +99,10 @@ fn optimize(plan: &LogicalPlan) -> Result<LogicalPlan> {
     let new_exprs = plan
         .expressions()
         .into_iter()
-        .map(|expr| {
-            let original_name = name_for_alias(&expr)?;
-            let expr = expr.rewrite(&mut expr_rewriter)?;
-            add_alias_if_changed(&original_name, expr)
-        })
+        .map(|expr| rewrite_preserving_name(expr, &mut expr_rewriter))
         .collect::<Result<Vec<_>>>()?;
 
     from_plan(plan, new_exprs.as_slice(), new_inputs.as_slice())
-}
-
-fn name_for_alias(expr: &Expr) -> Result<String> {
-    match expr {
-        Expr::Sort { expr, .. } => name_for_alias(expr),
-        expr => expr.name(),
-    }
-}
-
-fn add_alias_if_changed(original_name: &str, expr: Expr) -> Result<Expr> {
-    let new_name = name_for_alias(&expr)?;
-
-    if new_name == original_name {
-        return Ok(expr);
-    }
-
-    Ok(match expr {
-        Expr::Sort {
-            expr,
-            asc,
-            nulls_first,
-        } => {
-            let expr = add_alias_if_changed(original_name, *expr)?;
-            Expr::Sort {
-                expr: Box::new(expr),
-                asc,
-                nulls_first,
-            }
-        }
-        expr => expr.alias(original_name),
-    })
 }
 
 struct UnwrapCastExprRewriter {
@@ -152,18 +119,12 @@ impl ExprRewriter for UnwrapCastExprRewriter {
             // For case:
             // try_cast/cast(expr as data_type) op literal
             // literal op try_cast/cast(expr as data_type)
-            Expr::BinaryExpr { left, op, right } => {
+            Expr::BinaryExpr(BinaryExpr { left, op, right }) => {
                 let left = left.as_ref().clone();
                 let right = right.as_ref().clone();
-                let left_type = left.get_type(&self.schema);
-                let right_type = right.get_type(&self.schema);
-                // can't get the data type, just return the expr
-                if left_type.is_err() || right_type.is_err() {
-                    return Ok(expr.clone());
-                }
+                let left_type = left.get_type(&self.schema)?;
+                let right_type = right.get_type(&self.schema)?;
                 // Because the plan has been done the type coercion, the left and right must be equal
-                let left_type = left_type?;
-                let right_type = right_type?;
                 if is_support_data_type(&left_type)
                     && is_support_data_type(&right_type)
                     && is_comparison_op(op)
@@ -171,7 +132,7 @@ impl ExprRewriter for UnwrapCastExprRewriter {
                     match (&left, &right) {
                         (
                             Expr::Literal(left_lit_value),
-                            Expr::TryCast { expr, .. } | Expr::Cast { expr, .. },
+                            Expr::TryCast { expr, .. } | Expr::Cast(Cast { expr, .. }),
                         ) => {
                             // if the left_lit_value can be casted to the type of expr
                             // we need to unwrap the cast for cast/try_cast expr, and add cast to the literal
@@ -188,7 +149,7 @@ impl ExprRewriter for UnwrapCastExprRewriter {
                             }
                         }
                         (
-                            Expr::TryCast { expr, .. } | Expr::Cast { expr, .. },
+                            Expr::TryCast { expr, .. } | Expr::Cast(Cast { expr, .. }),
                             Expr::Literal(right_lit_value),
                         ) => {
                             // if the right_lit_value can be casted to the type of expr
@@ -225,10 +186,10 @@ impl ExprRewriter for UnwrapCastExprRewriter {
                         expr: internal_left_expr,
                         ..
                     }
-                    | Expr::Cast {
+                    | Expr::Cast(Cast {
                         expr: internal_left_expr,
                         ..
-                    },
+                    }),
                 ) = Some(left_expr.as_ref())
                 {
                     let internal_left = internal_left_expr.as_ref().clone();

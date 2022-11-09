@@ -21,11 +21,11 @@ use datafusion::arrow::{
     array::ArrayRef, array::Float32Array, array::Float64Array, datatypes::DataType,
     record_batch::RecordBatch,
 };
-
 use datafusion::from_slice::FromSlice;
 use datafusion::logical_expr::AggregateState;
-use datafusion::{error::Result, logical_plan::create_udaf, physical_plan::Accumulator};
+use datafusion::{error::Result, physical_plan::Accumulator};
 use datafusion::{logical_expr::Volatility, prelude::*, scalar::ScalarValue};
+use datafusion_expr::create_udaf;
 use std::sync::Arc;
 
 // create local session context with an in-memory table
@@ -38,11 +38,11 @@ fn create_context() -> Result<SessionContext> {
     // define data in two partitions
     let batch1 = RecordBatch::try_new(
         schema.clone(),
-        vec![Arc::new(Float32Array::from_slice(&[2.0, 4.0, 8.0]))],
+        vec![Arc::new(Float32Array::from_slice([2.0, 4.0, 8.0]))],
     )?;
     let batch2 = RecordBatch::try_new(
         schema.clone(),
-        vec![Arc::new(Float32Array::from_slice(&[64.0]))],
+        vec![Arc::new(Float32Array::from_slice([64.0]))],
     )?;
 
     // declare a new context. In spark API, this corresponds to a new spark SQLsession
