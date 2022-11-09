@@ -1592,16 +1592,18 @@ impl ScalarValue {
                     Arc::new(repeat(None::<&str>).take(size).collect::<BinaryArray>())
                 }
             },
-            ScalarValue::FixedSizeBinary(_, e) => match e {
+            ScalarValue::FixedSizeBinary(sz, e) => match e {
                 Some(value) => Arc::new(
-                    FixedSizeBinaryArray::try_from_sparse_iter(
+                    FixedSizeBinaryArray::try_from_sparse_iter_with_size(
                         repeat(Some(value.as_slice())).take(size),
+                        *sz,
                     )
                     .unwrap(),
                 ),
                 None => Arc::new(
-                    FixedSizeBinaryArray::try_from_sparse_iter(
+                    FixedSizeBinaryArray::try_from_sparse_iter_with_size(
                         repeat(None::<&[u8]>).take(size),
+                        *sz,
                     )
                     .unwrap(),
                 ),
