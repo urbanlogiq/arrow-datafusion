@@ -196,7 +196,6 @@ impl OptimizerRule for SingleDistinctToGroupBy {
                         alias_expr,
                         Arc::new(outer_aggr),
                         schema.clone(),
-                        None,
                     )?))
                 } else {
                     utils::optimize_children(self, plan, _optimizer_config)
@@ -297,8 +296,6 @@ mod tests {
         let plan = LogicalPlanBuilder::from(table_scan)
             .aggregate(vec![grouping_set], vec![count_distinct(col("c"))])?
             .build()?;
-
-        println!("{:?}", plan);
 
         // Should not be optimized
         let expected = "Aggregate: groupBy=[[CUBE (test.a, test.b)]], aggr=[[COUNT(DISTINCT test.c)]] [a:UInt32, b:UInt32, COUNT(DISTINCT test.c):Int64;N]\

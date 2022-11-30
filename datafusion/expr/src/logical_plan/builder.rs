@@ -31,7 +31,7 @@ use crate::{
         Window,
     },
     utils::{
-        can_hash, expand_qualified_wildcard, expand_wildcard, expr_to_columns,
+        can_hash, expand_qualified_wildcard, expand_wildcard,
         group_window_expr_by_sort_keys,
     },
     Expr, ExprSchemable, TableSource,
@@ -43,10 +43,7 @@ use datafusion_common::{
 };
 use std::any::Any;
 use std::convert::TryFrom;
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
-};
+use std::{collections::HashMap, sync::Arc};
 
 /// Default table name for unnamed table
 pub const UNNAMED_TABLE: &str = "?table?";
@@ -331,7 +328,6 @@ impl LogicalPlanBuilder {
                 input,
                 mut expr,
                 schema: _,
-                alias,
             }) if missing_cols
                 .iter()
                 .all(|c| input.schema().field_from_column(c).is_ok()) =>
@@ -346,7 +342,7 @@ impl LogicalPlanBuilder {
                 // projected alias.
                 missing_exprs.retain(|e| !expr.contains(e));
                 expr.extend(missing_exprs);
-                Ok(project_with_alias((*input).clone(), expr, alias)?)
+                Ok(project_with_alias((*input).clone(), expr, None)?)
             }
             _ => {
                 let new_inputs = curr_plan
@@ -378,8 +374,7 @@ impl LogicalPlanBuilder {
             .clone()
             .into_iter()
             .try_for_each::<_, Result<()>>(|expr| {
-                let mut columns: HashSet<Column> = HashSet::new();
-                expr_to_columns(&expr, &mut columns)?;
+                let columns = expr.to_columns()?;
 
                 columns.into_iter().for_each(|c| {
                     if schema.field_from_column(&c).is_err() {
@@ -414,13 +409,12 @@ impl LogicalPlanBuilder {
         Ok(Self::from(LogicalPlan::Projection(Projection::try_new(
             new_expr,
             Arc::new(sort_plan),
-            None,
         )?)))
     }
 
     /// Apply a union, preserving duplicate rows
     pub fn union(&self, plan: LogicalPlan) -> Result<Self> {
-        Ok(Self::from(union_with_alias(self.plan.clone(), plan, None)?))
+        Ok(Self::from(union(self.plan.clone(), plan)?))
     }
 
     /// Apply a union, removing duplicate rows
@@ -437,7 +431,7 @@ impl LogicalPlanBuilder {
         };
 
         Ok(Self::from(LogicalPlan::Distinct(Distinct {
-            input: Arc::new(union_with_alias(left_plan, right_plan, None)?),
+            input: Arc::new(union(left_plan, right_plan)?),
         })))
     }
 
@@ -863,11 +857,10 @@ pub(crate) fn validate_unique_names<'a>(
     })
 }
 
-pub fn project_with_column_index_alias(
+pub fn project_with_column_index(
     expr: Vec<Expr>,
     input: Arc<LogicalPlan>,
     schema: DFSchemaRef,
-    alias: Option<String>,
 ) -> Result<LogicalPlan> {
     let alias_expr = expr
         .into_iter()
@@ -879,16 +872,12 @@ pub fn project_with_column_index_alias(
         })
         .collect::<Vec<_>>();
     Ok(LogicalPlan::Projection(Projection::try_new_with_schema(
-        alias_expr, input, schema, alias,
+        alias_expr, input, schema,
     )?))
 }
 
-/// Union two logical plans with an optional alias.
-pub fn union_with_alias(
-    left_plan: LogicalPlan,
-    right_plan: LogicalPlan,
-    alias: Option<String>,
-) -> Result<LogicalPlan> {
+/// Union two logical plans.
+pub fn union(left_plan: LogicalPlan, right_plan: LogicalPlan) -> Result<LogicalPlan> {
     let left_col_num = left_plan.schema().fields().len();
 
     // the 2 queries should have same number of columns
@@ -919,7 +908,7 @@ pub fn union_with_alias(
                     })?;
 
             Ok(DFField::new(
-                alias.as_deref(),
+                None,
                 left_field.name(),
                 data_type,
                 nullable,
@@ -937,14 +926,13 @@ pub fn union_with_alias(
         .map(|p| {
             let plan = coerce_plan_expr_for_schema(&p, &union_schema)?;
             match plan {
-                LogicalPlan::Projection(Projection {
-                    expr, input, alias, ..
-                }) => Ok(Arc::new(project_with_column_index_alias(
-                    expr.to_vec(),
-                    input,
-                    Arc::new(union_schema.clone()),
-                    alias,
-                )?)),
+                LogicalPlan::Projection(Projection { expr, input, .. }) => {
+                    Ok(Arc::new(project_with_column_index(
+                        expr.to_vec(),
+                        input,
+                        Arc::new(union_schema.clone()),
+                    )?))
+                }
                 x => Ok(Arc::new(x)),
             }
         })
@@ -954,15 +942,9 @@ pub fn union_with_alias(
         return Err(DataFusionError::Plan("Empty UNION".to_string()));
     }
 
-    let union_schema = Arc::new(match alias {
-        Some(ref alias) => union_schema.replace_qualifier(alias.as_str()),
-        None => union_schema.strip_qualifiers(),
-    });
-
     Ok(LogicalPlan::Union(Union {
         inputs,
-        schema: union_schema,
-        alias,
+        schema: Arc::new(union_schema),
     }))
 }
 
@@ -995,17 +977,27 @@ pub fn project_with_alias(
         exprlist_to_fields(&projected_expr, &plan)?,
         plan.schema().metadata().clone(),
     )?;
-    let schema = match alias {
-        Some(ref alias) => input_schema.replace_qualifier(alias.as_str()),
-        None => input_schema,
-    };
 
-    Ok(LogicalPlan::Projection(Projection::try_new_with_schema(
+    let projection = LogicalPlan::Projection(Projection::try_new_with_schema(
         projected_expr,
         Arc::new(plan.clone()),
-        DFSchemaRef::new(schema),
+        DFSchemaRef::new(input_schema),
+    )?);
+    match alias {
+        Some(alias) => Ok(with_alias(projection, alias)),
+        None => Ok(projection),
+    }
+}
+
+/// Create a SubqueryAlias to wrap a LogicalPlan.
+pub fn with_alias(plan: LogicalPlan, alias: String) -> LogicalPlan {
+    let plan_schema = &**plan.schema();
+    let schema = (plan_schema.clone()).replace_qualifier(alias.as_str());
+    LogicalPlan::SubqueryAlias(SubqueryAlias {
+        input: Arc::new(plan),
         alias,
-    )?))
+        schema: Arc::new(schema),
+    })
 }
 
 /// Create a LogicalPlanBuilder representing a scan of a table with the provided name and schema.

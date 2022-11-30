@@ -49,6 +49,7 @@ use crate::physical_plan::aggregates::row_hash::GroupedHashAggregateStreamV2;
 use crate::physical_plan::EquivalenceProperties;
 pub use datafusion_expr::AggregateFunction;
 use datafusion_physical_expr::aggregate::row_accumulator::RowAccumulator;
+use datafusion_physical_expr::equivalence::project_equivalence_properties;
 pub use datafusion_physical_expr::expressions::create_aggregate_expr;
 use datafusion_physical_expr::normalize_out_expr_with_alias_schema;
 use datafusion_row::{row_supported, RowType};
@@ -149,23 +150,39 @@ impl PhysicalGroupBy {
     }
 }
 
+enum StreamType {
+    AggregateStream(AggregateStream),
+    GroupedHashAggregateStreamV2(GroupedHashAggregateStreamV2),
+    GroupedHashAggregateStream(GroupedHashAggregateStream),
+}
+
+impl From<StreamType> for SendableRecordBatchStream {
+    fn from(stream: StreamType) -> Self {
+        match stream {
+            StreamType::AggregateStream(stream) => Box::pin(stream),
+            StreamType::GroupedHashAggregateStreamV2(stream) => Box::pin(stream),
+            StreamType::GroupedHashAggregateStream(stream) => Box::pin(stream),
+        }
+    }
+}
+
 /// Hash aggregate execution plan
 #[derive(Debug)]
 pub struct AggregateExec {
     /// Aggregation mode (full, partial)
-    mode: AggregateMode,
+    pub(crate) mode: AggregateMode,
     /// Group by expressions
-    group_by: PhysicalGroupBy,
+    pub(crate) group_by: PhysicalGroupBy,
     /// Aggregate expressions
-    aggr_expr: Vec<Arc<dyn AggregateExpr>>,
+    pub(crate) aggr_expr: Vec<Arc<dyn AggregateExpr>>,
     /// Input plan, could be a partial aggregate or the input to the aggregate
-    input: Arc<dyn ExecutionPlan>,
+    pub(crate) input: Arc<dyn ExecutionPlan>,
     /// Schema after the aggregate is applied
     schema: SchemaRef,
     /// Input schema before any aggregation is applied. For partial aggregate this will be the
     /// same as input.schema() but for the final aggregate it will be the same as the input
     /// to the partial aggregate
-    input_schema: SchemaRef,
+    pub(crate) input_schema: SchemaRef,
     /// The alias map used to normalize out expressions like Partitioning and PhysicalSortExpr
     /// The key is the column from the input schema and the values are the columns from the output schema
     alias_map: HashMap<Column, Vec<Column>>,
@@ -260,6 +277,56 @@ impl AggregateExec {
         row_supported(&group_schema, RowType::Compact)
             && accumulator_v2_supported(&self.aggr_expr)
     }
+
+    fn execute_typed(
+        &self,
+        partition: usize,
+        context: Arc<TaskContext>,
+    ) -> Result<StreamType> {
+        let batch_size = context.session_config().batch_size();
+        let input = self.input.execute(partition, Arc::clone(&context))?;
+
+        let baseline_metrics = BaselineMetrics::new(&self.metrics, partition);
+
+        if self.group_by.expr.is_empty() {
+            Ok(StreamType::AggregateStream(AggregateStream::new(
+                self.mode,
+                self.schema.clone(),
+                self.aggr_expr.clone(),
+                input,
+                baseline_metrics,
+                context,
+                partition,
+            )?))
+        } else if self.row_aggregate_supported() {
+            Ok(StreamType::GroupedHashAggregateStreamV2(
+                GroupedHashAggregateStreamV2::new(
+                    self.mode,
+                    self.schema.clone(),
+                    self.group_by.clone(),
+                    self.aggr_expr.clone(),
+                    input,
+                    baseline_metrics,
+                    batch_size,
+                    context,
+                    partition,
+                )?,
+            ))
+        } else {
+            Ok(StreamType::GroupedHashAggregateStream(
+                GroupedHashAggregateStream::new(
+                    self.mode,
+                    self.schema.clone(),
+                    self.group_by.clone(),
+                    self.aggr_expr.clone(),
+                    input,
+                    baseline_metrics,
+                    context,
+                    partition,
+                )?,
+            ))
+        }
+    }
 }
 
 impl ExecutionPlan for AggregateExec {
@@ -315,10 +382,13 @@ impl ExecutionPlan for AggregateExec {
     }
 
     fn equivalence_properties(&self) -> EquivalenceProperties {
-        let mut input_equivalence_properties = self.input.equivalence_properties();
-        input_equivalence_properties.merge_properties_with_alias(&self.alias_map);
-        input_equivalence_properties.truncate_properties_not_in_schema(&self.schema);
-        input_equivalence_properties
+        let mut new_properties = EquivalenceProperties::new(self.schema());
+        project_equivalence_properties(
+            self.input.equivalence_properties(),
+            &self.alias_map,
+            &mut new_properties,
+        );
+        new_properties
     }
 
     fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
@@ -343,39 +413,8 @@ impl ExecutionPlan for AggregateExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        let batch_size = context.session_config().batch_size();
-        let input = self.input.execute(partition, context)?;
-
-        let baseline_metrics = BaselineMetrics::new(&self.metrics, partition);
-
-        if self.group_by.expr.is_empty() {
-            Ok(Box::pin(AggregateStream::new(
-                self.mode,
-                self.schema.clone(),
-                self.aggr_expr.clone(),
-                input,
-                baseline_metrics,
-            )?))
-        } else if self.row_aggregate_supported() {
-            Ok(Box::pin(GroupedHashAggregateStreamV2::new(
-                self.mode,
-                self.schema.clone(),
-                self.group_by.clone(),
-                self.aggr_expr.clone(),
-                input,
-                baseline_metrics,
-                batch_size,
-            )?))
-        } else {
-            Ok(Box::pin(GroupedHashAggregateStream::new(
-                self.mode,
-                self.schema.clone(),
-                self.group_by.clone(),
-                self.aggr_expr.clone(),
-                input,
-                baseline_metrics,
-            )?))
-        }
+        self.execute_typed(partition, context)
+            .map(|stream| stream.into())
     }
 
     fn metrics(&self) -> Option<MetricsSet> {
@@ -685,7 +724,8 @@ fn evaluate_group_by(
 
 #[cfg(test)]
 mod tests {
-    use crate::execution::context::TaskContext;
+    use crate::execution::context::{SessionConfig, TaskContext};
+    use crate::execution::runtime_env::{RuntimeConfig, RuntimeEnv};
     use crate::from_slice::FromSlice;
     use crate::physical_plan::aggregates::{
         AggregateExec, AggregateMode, PhysicalGroupBy,
@@ -696,16 +736,17 @@ mod tests {
     use crate::{assert_batches_sorted_eq, physical_plan::common};
     use arrow::array::{Float64Array, UInt32Array};
     use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-    use arrow::error::Result as ArrowResult;
+    use arrow::error::{ArrowError, Result as ArrowResult};
     use arrow::record_batch::RecordBatch;
     use datafusion_common::{DataFusionError, Result, ScalarValue};
-    use datafusion_physical_expr::expressions::{lit, Count};
+    use datafusion_physical_expr::expressions::{lit, ApproxDistinct, Count, Median};
     use datafusion_physical_expr::{AggregateExpr, PhysicalExpr, PhysicalSortExpr};
     use futures::{FutureExt, Stream};
     use std::any::Any;
     use std::sync::Arc;
     use std::task::{Context, Poll};
 
+    use super::StreamType;
     use crate::physical_plan::coalesce_partitions::CoalescePartitionsExec;
     use crate::physical_plan::{
         ExecutionPlan, Partitioning, RecordBatchStream, SendableRecordBatchStream,
@@ -1075,6 +1116,104 @@ mod tests {
             Arc::new(TestYieldingExec { yield_first: true });
 
         check_grouping_sets(input).await
+    }
+
+    #[tokio::test]
+    async fn test_oom() -> Result<()> {
+        let input: Arc<dyn ExecutionPlan> =
+            Arc::new(TestYieldingExec { yield_first: true });
+        let input_schema = input.schema();
+
+        let session_ctx = SessionContext::with_config_rt(
+            SessionConfig::default(),
+            Arc::new(
+                RuntimeEnv::new(RuntimeConfig::default().with_memory_limit(1, 1.0))
+                    .unwrap(),
+            ),
+        );
+        let task_ctx = session_ctx.task_ctx();
+
+        let groups_none = PhysicalGroupBy::default();
+        let groups_some = PhysicalGroupBy {
+            expr: vec![(col("a", &input_schema)?, "a".to_string())],
+            null_expr: vec![],
+            groups: vec![vec![false]],
+        };
+
+        // something that allocates within the aggregator
+        let aggregates_v0: Vec<Arc<dyn AggregateExpr>> = vec![Arc::new(Median::new(
+            col("a", &input_schema)?,
+            "MEDIAN(a)".to_string(),
+            DataType::UInt32,
+        ))];
+
+        // use slow-path in `hash.rs`
+        let aggregates_v1: Vec<Arc<dyn AggregateExpr>> =
+            vec![Arc::new(ApproxDistinct::new(
+                col("a", &input_schema)?,
+                "APPROX_DISTINCT(a)".to_string(),
+                DataType::UInt32,
+            ))];
+
+        // use fast-path in `row_hash.rs`.
+        let aggregates_v2: Vec<Arc<dyn AggregateExpr>> = vec![Arc::new(Avg::new(
+            col("b", &input_schema)?,
+            "AVG(b)".to_string(),
+            DataType::Float64,
+        ))];
+
+        for (version, groups, aggregates) in [
+            (0, groups_none, aggregates_v0),
+            (1, groups_some.clone(), aggregates_v1),
+            (2, groups_some, aggregates_v2),
+        ] {
+            let partial_aggregate = Arc::new(AggregateExec::try_new(
+                AggregateMode::Partial,
+                groups,
+                aggregates,
+                input.clone(),
+                input_schema.clone(),
+            )?);
+
+            let stream = partial_aggregate.execute_typed(0, task_ctx.clone())?;
+
+            // ensure that we really got the version we wanted
+            match version {
+                0 => {
+                    assert!(matches!(stream, StreamType::AggregateStream(_)));
+                }
+                1 => {
+                    assert!(matches!(stream, StreamType::GroupedHashAggregateStream(_)));
+                }
+                2 => {
+                    assert!(matches!(
+                        stream,
+                        StreamType::GroupedHashAggregateStreamV2(_)
+                    ));
+                }
+                _ => panic!("Unknown version: {version}"),
+            }
+
+            let stream: SendableRecordBatchStream = stream.into();
+            let err = common::collect(stream).await.unwrap_err();
+
+            // error root cause traversal is a bit complicated, see #4172.
+            if let DataFusionError::ArrowError(ArrowError::ExternalError(err)) = err {
+                if let Some(err) = err.downcast_ref::<DataFusionError>() {
+                    assert!(
+                        matches!(err, DataFusionError::ResourcesExhausted(_)),
+                        "Wrong inner error type: {}",
+                        err,
+                    );
+                } else {
+                    panic!("Wrong arrow error type: {err}")
+                }
+            } else {
+                panic!("Wrong outer error type: {err}")
+            }
+        }
+
+        Ok(())
     }
 
     #[tokio::test]

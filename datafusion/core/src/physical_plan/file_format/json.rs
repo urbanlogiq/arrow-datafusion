@@ -43,7 +43,7 @@ use std::path::Path;
 use std::sync::Arc;
 use tokio::task::{self, JoinHandle};
 
-use super::FileScanConfig;
+use super::{get_output_ordering, FileScanConfig};
 
 /// Execution plan for scanning NdJson data source
 #[derive(Debug, Clone)]
@@ -88,7 +88,7 @@ impl ExecutionPlan for NdJsonExec {
     }
 
     fn output_ordering(&self) -> Option<&[PhysicalSortExpr]> {
-        None
+        get_output_ordering(&self.base_config)
     }
 
     fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
@@ -176,13 +176,13 @@ impl FileOpener for JsonOpener {
         Ok(Box::pin(async move {
             match store.get(file_meta.location()).await? {
                 GetResult::File(file, _) => {
-                    let decoder = file_compression_type.convert_read(file);
+                    let decoder = file_compression_type.convert_read(file)?;
                     let reader = json::Reader::new(decoder, schema.clone(), options);
                     Ok(futures::stream::iter(reader).boxed())
                 }
                 GetResult::Stream(s) => {
                     let s = s.map_err(Into::into);
-                    let decoder = file_compression_type.convert_stream(s);
+                    let decoder = file_compression_type.convert_stream(s)?;
 
                     Ok(newline_delimited_stream(decoder)
                         .map_ok(move |bytes| {
@@ -215,7 +215,7 @@ pub async fn plan_to_json(
             for i in 0..plan.output_partitioning().partition_count() {
                 let plan = plan.clone();
                 let filename = format!("part-{}.json", i);
-                let path = fs_path.join(&filename);
+                let path = fs_path.join(filename);
                 let file = fs::File::create(path)?;
                 let mut writer = json::LineDelimitedWriter::new(file);
                 let task_ctx = Arc::new(TaskContext::from(state));
@@ -305,7 +305,8 @@ mod tests {
         file_compression_type,
         case(FileCompressionType::UNCOMPRESSED),
         case(FileCompressionType::GZIP),
-        case(FileCompressionType::BZIP2)
+        case(FileCompressionType::BZIP2),
+        case(FileCompressionType::XZ)
     )]
     #[tokio::test]
     async fn nd_json_exec_file_without_projection(
@@ -328,6 +329,7 @@ mod tests {
                 limit: Some(3),
                 table_partition_cols: vec![],
                 config_options: ConfigOptions::new().into_shareable(),
+                output_ordering: None,
             },
             file_compression_type.to_owned(),
         );
@@ -376,7 +378,8 @@ mod tests {
         file_compression_type,
         case(FileCompressionType::UNCOMPRESSED),
         case(FileCompressionType::GZIP),
-        case(FileCompressionType::BZIP2)
+        case(FileCompressionType::BZIP2),
+        case(FileCompressionType::XZ)
     )]
     #[tokio::test]
     async fn nd_json_exec_file_with_missing_column(
@@ -404,6 +407,7 @@ mod tests {
                 limit: Some(3),
                 table_partition_cols: vec![],
                 config_options: ConfigOptions::new().into_shareable(),
+                output_ordering: None,
             },
             file_compression_type.to_owned(),
         );
@@ -429,7 +433,8 @@ mod tests {
         file_compression_type,
         case(FileCompressionType::UNCOMPRESSED),
         case(FileCompressionType::GZIP),
-        case(FileCompressionType::BZIP2)
+        case(FileCompressionType::BZIP2),
+        case(FileCompressionType::XZ)
     )]
     #[tokio::test]
     async fn nd_json_exec_file_projection(
@@ -450,6 +455,7 @@ mod tests {
                 limit: None,
                 table_partition_cols: vec![],
                 config_options: ConfigOptions::new().into_shareable(),
+                output_ordering: None,
             },
             file_compression_type.to_owned(),
         );
@@ -528,7 +534,8 @@ mod tests {
         file_compression_type,
         case(FileCompressionType::UNCOMPRESSED),
         case(FileCompressionType::GZIP),
-        case(FileCompressionType::BZIP2)
+        case(FileCompressionType::BZIP2),
+        case(FileCompressionType::XZ)
     )]
     #[tokio::test]
     async fn test_chunked(file_compression_type: FileCompressionType) {

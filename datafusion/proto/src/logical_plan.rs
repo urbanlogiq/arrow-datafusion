@@ -27,8 +27,6 @@ use crate::{
 };
 use arrow::datatypes::{Schema, SchemaRef};
 use datafusion::datasource::TableProvider;
-use datafusion::execution::FunctionRegistry;
-use datafusion::physical_plan::ExecutionPlan;
 use datafusion::{
     datasource::{
         file_format::{
@@ -96,21 +94,6 @@ pub trait AsLogicalPlan: Debug + Send + Sync + Clone {
     ) -> Result<Self, DataFusionError>
     where
         Self: Sized;
-}
-
-pub trait PhysicalExtensionCodec: Debug + Send + Sync {
-    fn try_decode(
-        &self,
-        buf: &[u8],
-        inputs: &[Arc<dyn ExecutionPlan>],
-        registry: &dyn FunctionRegistry,
-    ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError>;
-
-    fn try_encode(
-        &self,
-        node: Arc<dyn ExecutionPlan>,
-        buf: &mut Vec<u8>,
-    ) -> Result<(), DataFusionError>;
 }
 
 pub trait LogicalExtensionCodec: Debug + Send + Sync {
@@ -416,6 +399,20 @@ impl AsLogicalPlan for LogicalPlanNode {
                     .map(|expr| parse_expr(expr, ctx))
                     .collect::<Result<Vec<_>, _>>()?;
 
+                let file_sort_order = scan
+                    .file_sort_order
+                    .iter()
+                    .map(|expr| parse_expr(expr, ctx))
+                    .collect::<Result<Vec<_>, _>>()?;
+
+                // Protobuf doesn't distinguish between "not present"
+                // and empty
+                let file_sort_order = if file_sort_order.is_empty() {
+                    None
+                } else {
+                    Some(file_sort_order)
+                };
+
                 let file_format: Arc<dyn FileFormat> =
                     match scan.file_format_type.as_ref().ok_or_else(|| {
                         proto_error(format!(
@@ -445,13 +442,26 @@ impl AsLogicalPlan for LogicalPlanNode {
                     .map(ListingTableUrl::parse)
                     .collect::<Result<Vec<_>, _>>()?;
 
-                let options = ListingOptions {
-                    file_extension: scan.file_extension.clone(),
-                    format: file_format,
-                    table_partition_cols: scan.table_partition_cols.clone(),
-                    collect_stat: scan.collect_stat,
-                    target_partitions: scan.target_partitions as usize,
-                };
+                let options = ListingOptions::new(file_format)
+                    .with_file_extension(scan.file_extension.clone())
+                    .with_table_partition_cols(
+                        scan.table_partition_cols
+                            .iter()
+                            .map(|col| {
+                                (
+                                    col.clone(),
+                                    schema
+                                        .field_with_name(col)
+                                        .unwrap()
+                                        .data_type()
+                                        .clone(),
+                                )
+                            })
+                            .collect(),
+                    )
+                    .with_collect_stat(scan.collect_stat)
+                    .with_target_partitions(scan.target_partitions as usize)
+                    .with_file_sort_order(file_sort_order);
 
                 let config =
                     ListingTableConfig::new_with_multi_paths(table_paths.clone())
@@ -557,17 +567,13 @@ impl AsLogicalPlan for LogicalPlanNode {
                     None
                 };
 
-                match create_extern_table.file_type.as_str() {
-                    "CSV" | "JSON" | "PARQUET" | "AVRO" => {}
-                    it => {
-                        let env = &ctx.state.as_ref().read().runtime_env;
-                        if !env.table_factories.contains_key(it) {
-                            Err(DataFusionError::Internal(format!(
-                                "No TableProvider for file type: {}",
-                                it
-                            )))?
-                        }
-                    }
+                let file_type = create_extern_table.file_type.as_str();
+                let env = &ctx.state.as_ref().read().runtime_env;
+                if !env.table_factories.contains_key(file_type) {
+                    Err(DataFusionError::Internal(format!(
+                        "No TableProvider for file type: {}",
+                        file_type
+                    )))?
                 }
 
                 Ok(LogicalPlan::CreateExternalTable(CreateExternalTable {
@@ -867,24 +873,34 @@ impl AsLogicalPlan for LogicalPlanNode {
                         FileFormatType::Avro(protobuf::AvroFormat {})
                     } else {
                         return Err(proto_error(format!(
-                            "Error converting file format, {:?} is invalid as a datafusion foramt.",
+                            "Error converting file format, {:?} is invalid as a datafusion format.",
                             listing_table.options().format
                         )));
                     };
+
+                    let options = listing_table.options();
+                    let file_sort_order =
+                        if let Some(file_sort_order) = &options.file_sort_order {
+                            file_sort_order
+                                .iter()
+                                .map(|expr| expr.try_into())
+                                .collect::<Result<Vec<protobuf::LogicalExprNode>, _>>()?
+                        } else {
+                            vec![]
+                        };
+
                     Ok(protobuf::LogicalPlanNode {
                         logical_plan_type: Some(LogicalPlanType::ListingScan(
                             protobuf::ListingTableScanNode {
                                 file_format_type: Some(file_format_type),
                                 table_name: table_name.to_owned(),
-                                collect_stat: listing_table.options().collect_stat,
-                                file_extension: listing_table
-                                    .options()
-                                    .file_extension
-                                    .clone(),
-                                table_partition_cols: listing_table
-                                    .options()
+                                collect_stat: options.collect_stat,
+                                file_extension: options.file_extension.clone(),
+                                table_partition_cols: options
                                     .table_partition_cols
-                                    .clone(),
+                                    .iter()
+                                    .map(|x| x.0.clone())
+                                    .collect::<Vec<_>>(),
                                 paths: listing_table
                                     .table_paths()
                                     .iter()
@@ -893,10 +909,8 @@ impl AsLogicalPlan for LogicalPlanNode {
                                 schema: Some(schema),
                                 projection,
                                 filters,
-                                target_partitions: listing_table
-                                    .options()
-                                    .target_partitions
-                                    as u32,
+                                target_partitions: options.target_partitions as u32,
+                                file_sort_order,
                             },
                         )),
                     })
@@ -938,28 +952,25 @@ impl AsLogicalPlan for LogicalPlanNode {
                     Ok(node)
                 }
             }
-            LogicalPlan::Projection(Projection {
-                expr, input, alias, ..
-            }) => Ok(protobuf::LogicalPlanNode {
-                logical_plan_type: Some(LogicalPlanType::Projection(Box::new(
-                    protobuf::ProjectionNode {
-                        input: Some(Box::new(
-                            protobuf::LogicalPlanNode::try_from_logical_plan(
-                                input.as_ref(),
-                                extension_codec,
-                            )?,
-                        )),
-                        expr: expr.iter().map(|expr| expr.try_into()).collect::<Result<
-                            Vec<_>,
-                            to_proto::Error,
-                        >>(
-                        )?,
-                        optional_alias: alias
-                            .clone()
-                            .map(protobuf::projection_node::OptionalAlias::Alias),
-                    },
-                ))),
-            }),
+            LogicalPlan::Projection(Projection { expr, input, .. }) => {
+                Ok(protobuf::LogicalPlanNode {
+                    logical_plan_type: Some(LogicalPlanType::Projection(Box::new(
+                        protobuf::ProjectionNode {
+                            input: Some(Box::new(
+                                protobuf::LogicalPlanNode::try_from_logical_plan(
+                                    input.as_ref(),
+                                    extension_codec,
+                                )?,
+                            )),
+                            expr: expr
+                                .iter()
+                                .map(|expr| expr.try_into())
+                                .collect::<Result<Vec<_>, to_proto::Error>>()?,
+                            optional_alias: None,
+                        },
+                    ))),
+                })
+            }
             LogicalPlan::Filter(filter) => {
                 let input: protobuf::LogicalPlanNode =
                     protobuf::LogicalPlanNode::try_from_logical_plan(

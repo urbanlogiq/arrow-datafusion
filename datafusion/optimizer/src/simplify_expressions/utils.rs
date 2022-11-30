@@ -15,9 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Utitity functions for expression simplification
-
-use arrow::datatypes::DECIMAL128_MAX_PRECISION;
+//! Utility functions for expression simplification
 
 use datafusion_common::{DataFusionError, Result, ScalarValue};
 use datafusion_expr::{
@@ -108,8 +106,12 @@ pub fn is_one(s: &Expr) -> bool {
         | Expr::Literal(ScalarValue::UInt64(Some(1))) => true,
         Expr::Literal(ScalarValue::Float32(Some(v))) if *v == 1. => true,
         Expr::Literal(ScalarValue::Float64(Some(v))) if *v == 1. => true,
-        Expr::Literal(ScalarValue::Decimal128(Some(v), _p, _s)) => {
-            *_s < DECIMAL128_MAX_PRECISION && POWS_OF_TEN[*_s as usize] == *v
+        Expr::Literal(ScalarValue::Decimal128(Some(v), _p, s)) => {
+            *s >= 0
+                && POWS_OF_TEN
+                    .get(*s as usize)
+                    .map(|x| x == v)
+                    .unwrap_or_default()
         }
         _ => false,
     }
@@ -152,6 +154,11 @@ pub fn is_op_with(target_op: Operator, haystack: &Expr, needle: &Expr) -> bool {
     matches!(haystack, Expr::BinaryExpr(BinaryExpr { left, op, right }) if op == &target_op && (needle == left.as_ref() || needle == right.as_ref()))
 }
 
+/// returns true if `not_expr` is !`expr`
+pub fn is_not_of(not_expr: &Expr, expr: &Expr) -> bool {
+    matches!(not_expr, Expr::Not(inner) if expr == inner.as_ref())
+}
+
 /// returns the contained boolean value in `expr` as
 /// `Expr::Literal(ScalarValue::Boolean(v))`.
 pub fn as_bool_lit(expr: Expr) -> Result<Option<bool>> {
@@ -166,7 +173,7 @@ pub fn as_bool_lit(expr: Expr) -> Result<Option<bool>> {
 
 /// negate a Not clause
 /// input is the clause to be negated.(args of Not clause)
-/// For BinaryExpr, use the negator of op instead.
+/// For BinaryExpr, use the negation of op instead.
 ///    not ( A > B) ===> (A <= B)
 /// For BoolExpr, not (A and B) ===> (not A) or (not B)
 ///     not (A or B) ===> (not A) and (not B)

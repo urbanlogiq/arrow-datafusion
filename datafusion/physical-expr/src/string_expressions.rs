@@ -23,12 +23,15 @@
 
 use arrow::{
     array::{
-        Array, ArrayRef, BooleanArray, GenericStringArray, Int32Array, Int64Array,
-        OffsetSizeTrait, PrimitiveArray, StringArray,
+        Array, ArrayRef, BooleanArray, GenericStringArray, Int32Array, OffsetSizeTrait,
+        StringArray,
     },
     datatypes::{ArrowNativeType, ArrowPrimitiveType, DataType},
 };
-use datafusion_common::ScalarValue;
+use datafusion_common::{
+    cast::{as_int64_array, as_primitive_array, as_string_array},
+    ScalarValue,
+};
 use datafusion_common::{DataFusionError, Result};
 use datafusion_expr::ColumnarValue;
 use std::any::type_name;
@@ -47,43 +50,6 @@ macro_rules! downcast_string_arg {
                     type_name::<GenericStringArray<T>>()
                 ))
             })?
-    }};
-}
-
-macro_rules! downcast_primitive_array_arg {
-    ($ARG:expr, $NAME:expr, $T:ident) => {{
-        $ARG.as_any()
-            .downcast_ref::<PrimitiveArray<T>>()
-            .ok_or_else(|| {
-                DataFusionError::Internal(format!(
-                    "could not cast {} to {}",
-                    $NAME,
-                    type_name::<PrimitiveArray<T>>()
-                ))
-            })?
-    }};
-}
-
-macro_rules! downcast_arg {
-    ($ARG:expr, $NAME:expr, $ARRAY_TYPE:ident) => {{
-        $ARG.as_any().downcast_ref::<$ARRAY_TYPE>().ok_or_else(|| {
-            DataFusionError::Internal(format!(
-                "could not cast {} to {}",
-                $NAME,
-                type_name::<$ARRAY_TYPE>()
-            ))
-        })?
-    }};
-}
-
-macro_rules! downcast_vec {
-    ($ARGS:expr, $ARRAY_TYPE:ident) => {{
-        $ARGS
-            .iter()
-            .map(|e| match e.as_any().downcast_ref::<$ARRAY_TYPE>() {
-                Some(array) => Ok(array),
-                _ => Err(DataFusionError::Internal("failed to downcast".to_string())),
-            })
     }};
 }
 
@@ -236,7 +202,7 @@ pub fn btrim<T: OffsetSizeTrait>(args: &[ArrayRef]) -> Result<ArrayRef> {
 /// Returns the character with the given code. chr(0) is disallowed because text data types cannot store that character.
 /// chr(65) = 'A'
 pub fn chr(args: &[ArrayRef]) -> Result<ArrayRef> {
-    let integer_array = downcast_arg!(args[0], "integer", Int64Array);
+    let integer_array = as_int64_array(&args[0])?;
 
     // first map is the iterator, second is for the `Option<_>`
     let result = integer_array
@@ -294,7 +260,7 @@ pub fn concat(args: &[ColumnarValue]) -> Result<ColumnarValue> {
                         }
                         ColumnarValue::Array(v) => {
                             if v.is_valid(index) {
-                                let v = v.as_any().downcast_ref::<StringArray>().unwrap();
+                                let v = as_string_array(v).unwrap();
                                 owned_string.push_str(v.value(index));
                             }
                         }
@@ -329,7 +295,10 @@ pub fn concat(args: &[ColumnarValue]) -> Result<ColumnarValue> {
 /// concat_ws(',', 'abcde', 2, NULL, 22) = 'abcde,2,22'
 pub fn concat_ws(args: &[ArrayRef]) -> Result<ArrayRef> {
     // downcast all arguments to strings
-    let args = downcast_vec!(args, StringArray).collect::<Result<Vec<&StringArray>>>()?;
+    let args = args
+        .iter()
+        .map(|e| as_string_array(e))
+        .collect::<Result<Vec<&StringArray>>>()?;
 
     // do not accept 0 or 1 arguments.
     if args.len() < 2 {
@@ -442,7 +411,7 @@ pub fn ltrim<T: OffsetSizeTrait>(args: &[ArrayRef]) -> Result<ArrayRef> {
 /// repeat('Pg', 4) = 'PgPgPgPg'
 pub fn repeat<T: OffsetSizeTrait>(args: &[ArrayRef]) -> Result<ArrayRef> {
     let string_array = downcast_string_arg!(args[0], "string", T);
-    let number_array = downcast_arg!(args[1], "number", Int64Array);
+    let number_array = as_int64_array(&args[1])?;
 
     let result = string_array
         .iter()
@@ -520,8 +489,7 @@ pub fn rtrim<T: OffsetSizeTrait>(args: &[ArrayRef]) -> Result<ArrayRef> {
 pub fn split_part<T: OffsetSizeTrait>(args: &[ArrayRef]) -> Result<ArrayRef> {
     let string_array = downcast_string_arg!(args[0], "string", T);
     let delimiter_array = downcast_string_arg!(args[1], "delimiter", T);
-    let n_array = downcast_arg!(args[2], "n", Int64Array);
-
+    let n_array = as_int64_array(&args[2])?;
     let result = string_array
         .iter()
         .zip(delimiter_array.iter())
@@ -571,14 +539,27 @@ pub fn to_hex<T: ArrowPrimitiveType>(args: &[ArrayRef]) -> Result<ArrayRef>
 where
     T::Native: OffsetSizeTrait,
 {
-    let integer_array = downcast_primitive_array_arg!(args[0], "integer", T);
+    let integer_array = as_primitive_array::<T>(&args[0])?;
 
     let result = integer_array
         .iter()
         .map(|integer| {
-            integer.map(|integer| format!("{:x}", integer.to_usize().unwrap()))
+            if let Some(value) = integer {
+                if let Some(value_usize) = value.to_usize() {
+                    Ok(Some(format!("{:x}", value_usize)))
+                } else if let Some(value_isize) = value.to_isize() {
+                    Ok(Some(format!("{:x}", value_isize)))
+                } else {
+                    Err(DataFusionError::Internal(format!(
+                        "Unsupported data type {:?} for function to_hex",
+                        integer,
+                    )))
+                }
+            } else {
+                Ok(None)
+            }
         })
-        .collect::<GenericStringArray<i32>>();
+        .collect::<Result<GenericStringArray<i32>>>()?;
 
     Ok(Arc::new(result) as ArrayRef)
 }
@@ -604,4 +585,52 @@ pub fn uuid(args: &[ColumnarValue]) -> Result<ColumnarValue> {
     let values = iter::repeat_with(|| Uuid::new_v4().to_string()).take(len);
     let array = GenericStringArray::<i32>::from_iter_values(values);
     Ok(ColumnarValue::Array(Arc::new(array)))
+}
+
+#[cfg(test)]
+mod tests {
+
+    use crate::string_expressions;
+    use arrow::{array::Int32Array, datatypes::Int32Type};
+
+    use super::*;
+
+    #[test]
+    // Test to_hex function for zero
+    fn to_hex_zero() -> Result<()> {
+        let array = vec![0].into_iter().collect::<Int32Array>();
+        let array_ref = Arc::new(array);
+        let hex_value_arc = string_expressions::to_hex::<Int32Type>(&[array_ref])?;
+        let hex_value = as_string_array(&hex_value_arc)?;
+        let expected = StringArray::from(vec![Some("0")]);
+        assert_eq!(&expected, hex_value);
+
+        Ok(())
+    }
+
+    #[test]
+    // Test to_hex function for positive number
+    fn to_hex_positive_number() -> Result<()> {
+        let array = vec![100].into_iter().collect::<Int32Array>();
+        let array_ref = Arc::new(array);
+        let hex_value_arc = string_expressions::to_hex::<Int32Type>(&[array_ref])?;
+        let hex_value = as_string_array(&hex_value_arc)?;
+        let expected = StringArray::from(vec![Some("64")]);
+        assert_eq!(&expected, hex_value);
+
+        Ok(())
+    }
+
+    #[test]
+    // Test to_hex function for negative number
+    fn to_hex_negative_number() -> Result<()> {
+        let array = vec![-1].into_iter().collect::<Int32Array>();
+        let array_ref = Arc::new(array);
+        let hex_value_arc = string_expressions::to_hex::<Int32Type>(&[array_ref])?;
+        let hex_value = as_string_array(&hex_value_arc)?;
+        let expected = StringArray::from(vec![Some("ffffffffffffffff")]);
+        assert_eq!(&expected, hex_value);
+
+        Ok(())
+    }
 }

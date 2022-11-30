@@ -47,8 +47,8 @@ fn case_when() -> Result<()> {
 
     let sql = "SELECT CASE WHEN col_uint32 > 0 THEN 1 ELSE 0 END FROM test";
     let plan = test_sql(sql)?;
-    let expected = "Projection: CASE WHEN CAST(test.col_uint32 AS Int64) > Int64(0) THEN Int64(1) ELSE Int64(0) END\
-    \n  TableScan: test projection=[col_uint32]";
+    let expected = "Projection: CASE WHEN test.col_uint32 > UInt32(0) THEN Int64(1) ELSE Int64(0) END AS CASE WHEN test.col_uint32 > Int64(0) THEN Int64(1) ELSE Int64(0) END\
+                    \n  TableScan: test projection=[col_uint32]";
     assert_eq!(expected, format!("{:?}", plan));
     Ok(())
 }
@@ -63,14 +63,15 @@ fn subquery_filter_with_cast() -> Result<()> {
         AND (cast('2002-05-08' as date) + interval '5 days')\
     )";
     let plan = test_sql(sql)?;
-    let expected =
-        "Projection: test.col_int32\n  Filter: CAST(test.col_int32 AS Float64) > __sq_1.__value\
-        \n    CrossJoin:\
-        \n      TableScan: test projection=[col_int32]\
-        \n      Projection: AVG(test.col_int32) AS __value, alias=__sq_1\
-        \n        Aggregate: groupBy=[[]], aggr=[[AVG(test.col_int32)]]\
-        \n          Filter: test.col_utf8 >= Utf8(\"2002-05-08\") AND test.col_utf8 <= Utf8(\"2002-05-13\")\
-        \n            TableScan: test projection=[col_int32, col_utf8]";
+    let expected = "Projection: test.col_int32\
+    \n  Filter: CAST(test.col_int32 AS Float64) > __sq_1.__value\
+    \n    CrossJoin:\
+    \n      TableScan: test projection=[col_int32]\
+    \n      SubqueryAlias: __sq_1\
+    \n        Projection: AVG(test.col_int32) AS __value\
+    \n          Aggregate: groupBy=[[]], aggr=[[AVG(test.col_int32)]]\
+    \n            Filter: test.col_utf8 >= Utf8(\"2002-05-08\") AND test.col_utf8 <= Utf8(\"2002-05-13\")\
+    \n              TableScan: test projection=[col_int32, col_utf8]";
     assert_eq!(expected, format!("{:?}", plan));
     Ok(())
 }
@@ -91,7 +92,7 @@ fn unsigned_target_type() -> Result<()> {
     let sql = "SELECT col_utf8 FROM test WHERE col_uint32 > 0";
     let plan = test_sql(sql)?;
     let expected = "Projection: test.col_utf8\
-                    \n  Filter: CAST(test.col_uint32 AS Int64) > Int64(0)\
+                    \n  Filter: test.col_uint32 > UInt32(0)\
                     \n    TableScan: test projection=[col_uint32, col_utf8]";
     assert_eq!(expected, format!("{:?}", plan));
     Ok(())
@@ -236,7 +237,8 @@ fn timestamp_nano_ts_none_predicates() -> Result<()> {
     // constant and compared to the column without a cast so it can be
     // pushed down / pruned
     let expected =
-        "Projection: test.col_int32\n  Filter: CAST(test.col_ts_nano_none AS Timestamp(Nanosecond, Some(\"+00:00\"))) < TimestampNanosecond(1666612093000000000, Some(\"+00:00\"))\
+        "Projection: test.col_int32\
+         \n  Filter: test.col_ts_nano_none < TimestampNanosecond(1666612093000000000, None)\
          \n    TableScan: test projection=[col_int32, col_ts_nano_none]";
     assert_eq!(expected, format!("{:?}", plan));
     Ok(())
@@ -257,6 +259,51 @@ fn timestamp_nano_ts_utc_predicates() {
     assert_eq!(expected, format!("{:?}", plan));
 }
 
+#[test]
+fn propagate_empty_relation() {
+    let sql = "SELECT test.col_int32 FROM test JOIN ( SELECT col_int32 FROM test WHERE false ) AS ta1 ON test.col_int32 = ta1.col_int32;";
+    let plan = test_sql(sql).unwrap();
+    // when children exist EmptyRelation, it will bottom-up propagate.
+    let expected = "EmptyRelation";
+    assert_eq!(expected, format!("{:?}", plan));
+}
+
+#[test]
+fn join_keys_in_subquery_alias() {
+    let sql = "SELECT * FROM test AS A, ( SELECT col_int32 as key FROM test ) AS B where A.col_int32 = B.key;";
+    let plan = test_sql(sql).unwrap();
+    let expected = "Projection: a.col_int32, a.col_uint32, a.col_utf8, a.col_date32, a.col_date64, a.col_ts_nano_none, a.col_ts_nano_utc, b.key\
+    \n  Inner Join: a.col_int32 = b.key\
+    \n    SubqueryAlias: a\
+    \n      Filter: test.col_int32 IS NOT NULL\
+    \n        TableScan: test projection=[col_int32, col_uint32, col_utf8, col_date32, col_date64, col_ts_nano_none, col_ts_nano_utc]\
+    \n    SubqueryAlias: b\
+    \n      Projection: test.col_int32 AS key\
+    \n        Filter: test.col_int32 IS NOT NULL\
+    \n          TableScan: test projection=[col_int32]";
+    assert_eq!(expected, format!("{:?}", plan));
+}
+
+#[test]
+fn join_keys_in_subquery_alias_1() {
+    let sql = "SELECT * FROM test AS A, ( SELECT test.col_int32 AS key FROM test JOIN test AS C on test.col_int32 = C.col_int32 ) AS B where A.col_int32 = B.key;";
+    let plan = test_sql(sql).unwrap();
+    let expected = "Projection: a.col_int32, a.col_uint32, a.col_utf8, a.col_date32, a.col_date64, a.col_ts_nano_none, a.col_ts_nano_utc, b.key\
+    \n  Inner Join: a.col_int32 = b.key\
+    \n    SubqueryAlias: a\
+    \n      Filter: test.col_int32 IS NOT NULL\
+    \n        TableScan: test projection=[col_int32, col_uint32, col_utf8, col_date32, col_date64, col_ts_nano_none, col_ts_nano_utc]\
+    \n    SubqueryAlias: b\
+    \n      Projection: test.col_int32 AS key\
+    \n        Inner Join: test.col_int32 = c.col_int32\
+    \n          Filter: test.col_int32 IS NOT NULL\
+    \n            TableScan: test projection=[col_int32]\
+    \n          SubqueryAlias: c\
+    \n            Filter: test.col_int32 IS NOT NULL\
+    \n              TableScan: test projection=[col_int32]";
+    assert_eq!(expected, format!("{:?}", plan));
+}
+
 fn test_sql(sql: &str) -> Result<LogicalPlan> {
     // parse the SQL
     let dialect = GenericDialect {}; // or AnsiDialect, or your own dialect ...
@@ -269,8 +316,8 @@ fn test_sql(sql: &str) -> Result<LogicalPlan> {
     let plan = sql_to_rel.sql_statement_to_plan(statement.clone()).unwrap();
 
     // hard code the return value of now()
-    let now_time =
-        DateTime::<Utc>::from_utc(NaiveDateTime::from_timestamp(1666615693, 0), Utc);
+    let ts = NaiveDateTime::from_timestamp_opt(1666615693, 0).unwrap();
+    let now_time = DateTime::<Utc>::from_utc(ts, Utc);
     let mut config = OptimizerConfig::new()
         .with_skip_failing_rules(false)
         .with_query_execution_start_time(now_time);

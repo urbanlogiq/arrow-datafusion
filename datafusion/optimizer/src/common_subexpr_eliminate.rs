@@ -101,7 +101,6 @@ impl OptimizerRule for CommonSubexprEliminate {
                 expr,
                 input,
                 schema,
-                alias,
             }) => {
                 let input_schema = Arc::clone(input.schema());
                 let arrays = to_arrays(expr, input_schema, &mut expr_set)?;
@@ -118,7 +117,6 @@ impl OptimizerRule for CommonSubexprEliminate {
                     pop_expr(&mut new_expr)?,
                     Arc::new(new_input),
                     schema.clone(),
-                    alias.clone(),
                 )?))
             }
             LogicalPlan::Filter(filter) => {
@@ -221,19 +219,19 @@ impl OptimizerRule for CommonSubexprEliminate {
                     fetch: *fetch,
                 }))
             }
-            LogicalPlan::Join { .. }
+            LogicalPlan::Join(_)
             | LogicalPlan::CrossJoin(_)
             | LogicalPlan::Repartition(_)
             | LogicalPlan::Union(_)
-            | LogicalPlan::TableScan { .. }
+            | LogicalPlan::TableScan(_)
             | LogicalPlan::Values(_)
             | LogicalPlan::EmptyRelation(_)
             | LogicalPlan::Subquery(_)
             | LogicalPlan::SubqueryAlias(_)
             | LogicalPlan::Limit(_)
             | LogicalPlan::CreateExternalTable(_)
-            | LogicalPlan::Explain { .. }
-            | LogicalPlan::Analyze { .. }
+            | LogicalPlan::Explain(_)
+            | LogicalPlan::Analyze(_)
             | LogicalPlan::CreateMemoryTable(_)
             | LogicalPlan::CreateView(_)
             | LogicalPlan::CreateCatalogSchema(_)
@@ -242,7 +240,7 @@ impl OptimizerRule for CommonSubexprEliminate {
             | LogicalPlan::DropView(_)
             | LogicalPlan::SetVariable(_)
             | LogicalPlan::Distinct(_)
-            | LogicalPlan::Extension { .. } => {
+            | LogicalPlan::Extension(_) => {
                 // apply the optimization to all inputs of the plan
                 utils::optimize_children(self, plan, optimizer_config)
             }
@@ -328,7 +326,6 @@ fn build_project_plan(
         project_exprs,
         Arc::new(input),
         Arc::new(schema),
-        None,
     )?))
 }
 
@@ -543,7 +540,7 @@ impl ExprRewriter for CommonSubexprRewriter<'_> {
         // Alias this `Column` expr to it original "expr name",
         // `projection_push_down` optimizer use "expr name" to eliminate useless
         // projections.
-        Ok(col(id).alias(&expr_name))
+        Ok(col(id).alias(expr_name))
     }
 }
 

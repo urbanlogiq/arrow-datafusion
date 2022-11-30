@@ -103,14 +103,14 @@ impl FileFormat for JsonFormat {
 
             let schema = match store.get(&object.location).await? {
                 GetResult::File(file, _) => {
-                    let decoder = file_compression_type.convert_read(file);
+                    let decoder = file_compression_type.convert_read(file)?;
                     let mut reader = BufReader::new(decoder);
                     let iter = ValueIter::new(&mut reader, None);
                     infer_json_schema_from_iterator(iter.take_while(|_| take_while()))?
                 }
                 r @ GetResult::Stream(_) => {
                     let data = r.bytes().await?;
-                    let decoder = file_compression_type.convert_read(data.reader());
+                    let decoder = file_compression_type.convert_read(data.reader())?;
                     let mut reader = BufReader::new(decoder);
                     let iter = ValueIter::new(&mut reader, None);
                     infer_json_schema_from_iterator(iter.take_while(|_| take_while()))?
@@ -149,7 +149,7 @@ impl FileFormat for JsonFormat {
 #[cfg(test)]
 mod tests {
     use super::super::test_util::scan_format;
-    use arrow::array::Int64Array;
+    use datafusion_common::cast::as_int64_array;
     use futures::StreamExt;
     use object_store::local::LocalFileSystem;
 
@@ -228,11 +228,7 @@ mod tests {
         assert_eq!(1, batches[0].num_columns());
         assert_eq!(12, batches[0].num_rows());
 
-        let array = batches[0]
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
+        let array = as_int64_array(batches[0].column(0))?;
         let mut values: Vec<i64> = vec![];
         for i in 0..batches[0].num_rows() {
             values.push(array.value(i));

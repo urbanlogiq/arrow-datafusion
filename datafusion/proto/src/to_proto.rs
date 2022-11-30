@@ -209,9 +209,9 @@ impl TryFrom<&DataType> for protobuf::arrow_type::ArrowTypeEnum {
                     value: Some(Box::new(value_type.as_ref().try_into()?)),
                 }))
             }
-            DataType::Decimal128(whole, fractional) => Self::Decimal(protobuf::Decimal {
-                whole: *whole as u64,
-                fractional: *fractional as u64,
+            DataType::Decimal128(precision, scale) => Self::Decimal(protobuf::Decimal {
+                precision: *precision as u32,
+                scale: *scale as i32,
             }),
             DataType::Decimal256(_, _) => {
                 return Err(Error::General("Proto serialization error: The Decimal256 data type is not yet supported".to_owned()))
@@ -1075,8 +1075,50 @@ impl TryFrom<&ScalarValue> for protobuf::ScalarValue {
                 })
             }
 
-            datafusion::scalar::ScalarValue::Time64(v) => {
-                create_proto_scalar(v, &data_type, |v| Value::Time64Value(*v))
+            datafusion::scalar::ScalarValue::Time32Second(v) => {
+                create_proto_scalar(v, &data_type, |v| {
+                    Value::Time32Value(protobuf::ScalarTime32Value {
+                        value: Some(
+                            protobuf::scalar_time32_value::Value::Time32SecondValue(*v),
+                        ),
+                    })
+                })
+            }
+
+            datafusion::scalar::ScalarValue::Time32Millisecond(v) => {
+                create_proto_scalar(v, &data_type, |v| {
+                    Value::Time32Value(protobuf::ScalarTime32Value {
+                        value: Some(
+                            protobuf::scalar_time32_value::Value::Time32MillisecondValue(
+                                *v,
+                            ),
+                        ),
+                    })
+                })
+            }
+
+            datafusion::scalar::ScalarValue::Time64Microsecond(v) => {
+                create_proto_scalar(v, &data_type, |v| {
+                    Value::Time64Value(protobuf::ScalarTime64Value {
+                        value: Some(
+                            protobuf::scalar_time64_value::Value::Time64MicrosecondValue(
+                                *v,
+                            ),
+                        ),
+                    })
+                })
+            }
+
+            datafusion::scalar::ScalarValue::Time64Nanosecond(v) => {
+                create_proto_scalar(v, &data_type, |v| {
+                    Value::Time64Value(protobuf::ScalarTime64Value {
+                        value: Some(
+                            protobuf::scalar_time64_value::Value::Time64NanosecondValue(
+                                *v,
+                            ),
+                        ),
+                    })
+                })
             }
 
             datafusion::scalar::ScalarValue::IntervalMonthDayNano(v) => {

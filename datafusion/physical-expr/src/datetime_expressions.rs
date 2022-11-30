@@ -195,7 +195,10 @@ pub fn make_current_date(
     now_ts: DateTime<Utc>,
 ) -> impl Fn(&[ColumnarValue]) -> Result<ColumnarValue> {
     let days = Some(
-        now_ts.num_days_from_ce() - NaiveDate::from_ymd(1970, 1, 1).num_days_from_ce(),
+        now_ts.num_days_from_ce()
+            - NaiveDate::from_ymd_opt(1970, 1, 1)
+                .unwrap()
+                .num_days_from_ce(),
     );
     move |_arg| Ok(ColumnarValue::Scalar(ScalarValue::Date32(days)))
 }
@@ -210,7 +213,7 @@ pub fn make_current_time(
     now_ts: DateTime<Utc>,
 ) -> impl Fn(&[ColumnarValue]) -> Result<ColumnarValue> {
     let nano = Some(now_ts.timestamp_nanos() % 86400000000000);
-    move |_arg| Ok(ColumnarValue::Scalar(ScalarValue::Time64(nano)))
+    move |_arg| Ok(ColumnarValue::Scalar(ScalarValue::Time64Nanosecond(nano)))
 }
 
 fn quarter_month(date: &NaiveDateTime) -> u32 {

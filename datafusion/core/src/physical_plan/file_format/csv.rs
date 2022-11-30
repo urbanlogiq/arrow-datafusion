@@ -43,7 +43,7 @@ use std::path::Path;
 use std::sync::Arc;
 use tokio::task::{self, JoinHandle};
 
-use super::FileScanConfig;
+use super::{get_output_ordering, FileScanConfig};
 
 /// Execution plan for scanning a CSV file
 #[derive(Debug, Clone)]
@@ -109,8 +109,9 @@ impl ExecutionPlan for CsvExec {
         Partitioning::UnknownPartitioning(self.base_config.file_groups.len())
     }
 
+    /// See comments on `impl ExecutionPlan for ParquetExec`: output order can't be
     fn output_ordering(&self) -> Option<&[PhysicalSortExpr]> {
-        None
+        get_output_ordering(&self.base_config)
     }
 
     fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
@@ -217,13 +218,13 @@ impl FileOpener for CsvOpener {
         Ok(Box::pin(async move {
             match store.get(file_meta.location()).await? {
                 GetResult::File(file, _) => {
-                    let decoder = file_compression_type.convert_read(file);
+                    let decoder = file_compression_type.convert_read(file)?;
                     Ok(futures::stream::iter(config.open(decoder, true)).boxed())
                 }
                 GetResult::Stream(s) => {
                     let mut first_chunk = true;
                     let s = s.map_err(Into::<DataFusionError>::into);
-                    let decoder = file_compression_type.convert_stream(s);
+                    let decoder = file_compression_type.convert_stream(s)?;
                     Ok(newline_delimited_stream(decoder)
                         .map_ok(move |bytes| {
                             let reader = config.open(bytes.reader(), first_chunk);
@@ -252,7 +253,7 @@ pub async fn plan_to_csv(
             for i in 0..plan.output_partitioning().partition_count() {
                 let plan = plan.clone();
                 let filename = format!("part-{}.csv", i);
-                let path = fs_path.join(&filename);
+                let path = fs_path.join(filename);
                 let file = fs::File::create(path)?;
                 let mut writer = csv::Writer::new(file);
                 let task_ctx = Arc::new(TaskContext::from(state));
@@ -286,6 +287,7 @@ mod tests {
     use super::*;
     use crate::datasource::file_format::file_type::FileType;
     use crate::physical_plan::file_format::chunked_store::ChunkedStore;
+    use crate::physical_plan::file_format::partition_type_wrap;
     use crate::prelude::*;
     use crate::test::{partitioned_csv_config, partitioned_file_groups};
     use crate::test_util::{aggr_test_schema_with_missing_col, arrow_test_data};
@@ -302,7 +304,8 @@ mod tests {
         file_compression_type,
         case(FileCompressionType::UNCOMPRESSED),
         case(FileCompressionType::GZIP),
-        case(FileCompressionType::BZIP2)
+        case(FileCompressionType::BZIP2),
+        case(FileCompressionType::XZ)
     )]
     #[tokio::test]
     async fn csv_exec_with_projection(
@@ -356,7 +359,8 @@ mod tests {
         file_compression_type,
         case(FileCompressionType::UNCOMPRESSED),
         case(FileCompressionType::GZIP),
-        case(FileCompressionType::BZIP2)
+        case(FileCompressionType::BZIP2),
+        case(FileCompressionType::XZ)
     )]
     #[tokio::test]
     async fn csv_exec_with_limit(
@@ -410,7 +414,8 @@ mod tests {
         file_compression_type,
         case(FileCompressionType::UNCOMPRESSED),
         case(FileCompressionType::GZIP),
-        case(FileCompressionType::BZIP2)
+        case(FileCompressionType::BZIP2),
+        case(FileCompressionType::XZ)
     )]
     #[tokio::test]
     async fn csv_exec_with_missing_column(
@@ -464,7 +469,8 @@ mod tests {
         file_compression_type,
         case(FileCompressionType::UNCOMPRESSED),
         case(FileCompressionType::GZIP),
-        case(FileCompressionType::BZIP2)
+        case(FileCompressionType::BZIP2),
+        case(FileCompressionType::XZ)
     )]
     #[tokio::test]
     async fn csv_exec_with_partition(
@@ -487,7 +493,8 @@ mod tests {
         let mut config = partitioned_csv_config(file_schema, file_groups)?;
 
         // Add partition columns
-        config.table_partition_cols = vec!["date".to_owned()];
+        config.table_partition_cols =
+            vec![("date".to_owned(), partition_type_wrap(DataType::Utf8))];
         config.file_groups[0][0].partition_values =
             vec![ScalarValue::Utf8(Some("2021-10-26".to_owned()))];
 
@@ -539,7 +546,7 @@ mod tests {
         // generate a partitioned file
         for partition in 0..partition_count {
             let filename = format!("partition-{}.{}", partition, file_extension);
-            let file_path = tmp_dir.path().join(&filename);
+            let file_path = tmp_dir.path().join(filename);
             let mut file = File::create(file_path)?;
 
             // generate some data
@@ -556,7 +563,8 @@ mod tests {
         file_compression_type,
         case(FileCompressionType::UNCOMPRESSED),
         case(FileCompressionType::GZIP),
-        case(FileCompressionType::BZIP2)
+        case(FileCompressionType::BZIP2),
+        case(FileCompressionType::XZ)
     )]
     #[tokio::test]
     async fn test_chunked(file_compression_type: FileCompressionType) {

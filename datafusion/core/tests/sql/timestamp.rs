@@ -890,7 +890,7 @@ async fn group_by_timestamp_millis() -> Result<()> {
         ),
         Field::new("count", DataType::Int32, false),
     ]));
-    let base_dt = Utc.ymd(2018, 7, 1).and_hms(6, 0, 0); // 2018-Jul-01 06:00
+    let base_dt = Utc.with_ymd_and_hms(2018, 7, 1, 6, 0, 0).unwrap(); // 2018-Jul-01 06:00
     let hour1 = Duration::hours(1);
     let timestamps = vec![
         base_dt.timestamp_millis(),
@@ -1579,7 +1579,7 @@ async fn test_cast_to_time_with_time_zone_should_not_work() -> Result<()> {
 
     assert_eq!(
         results.to_string(),
-        "This feature is not implemented: Unsupported SQL type Time(WithTimeZone)"
+        "This feature is not implemented: Unsupported SQL type Time(None, WithTimeZone)"
     );
 
     Ok(())
@@ -1612,7 +1612,7 @@ async fn test_cast_to_timetz_should_not_work() -> Result<()> {
 
     assert_eq!(
         results.to_string(),
-        "This feature is not implemented: Unsupported SQL type Time(Tz)"
+        "This feature is not implemented: Unsupported SQL type Time(None, Tz)"
     );
     Ok(())
 }

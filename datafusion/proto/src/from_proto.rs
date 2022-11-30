@@ -265,9 +265,9 @@ impl TryFrom<&protobuf::arrow_type::ArrowTypeEnum> for DataType {
                 protobuf::IntervalUnit::try_from(interval_unit)?.into(),
             ),
             arrow_type::ArrowTypeEnum::Decimal(protobuf::Decimal {
-                whole,
-                fractional,
-            }) => DataType::Decimal128(*whole as u8, *fractional as u8),
+                precision,
+                scale,
+            }) => DataType::Decimal128(*precision as u8, *scale as i8),
             arrow_type::ArrowTypeEnum::List(list) => {
                 let list_type =
                     list.as_ref().field_type.as_deref().required("field_type")?;
@@ -579,11 +579,34 @@ impl TryFrom<&protobuf::ScalarValue> for ScalarValue {
                 Self::Decimal128(
                     Some(i128::from_be_bytes(array)),
                     val.p as u8,
-                    val.s as u8,
+                    val.s as i8,
                 )
             }
             Value::Date64Value(v) => Self::Date64(Some(*v)),
-            Value::Time64Value(v) => Self::Time64(Some(*v)),
+            Value::Time32Value(v) => {
+                let time_value =
+                    v.value.as_ref().ok_or_else(|| Error::required("value"))?;
+                match time_value {
+                    protobuf::scalar_time32_value::Value::Time32SecondValue(t) => {
+                        Self::Time32Second(Some(*t))
+                    }
+                    protobuf::scalar_time32_value::Value::Time32MillisecondValue(t) => {
+                        Self::Time32Millisecond(Some(*t))
+                    }
+                }
+            }
+            Value::Time64Value(v) => {
+                let time_value =
+                    v.value.as_ref().ok_or_else(|| Error::required("value"))?;
+                match time_value {
+                    protobuf::scalar_time64_value::Value::Time64MicrosecondValue(t) => {
+                        Self::Time64Microsecond(Some(*t))
+                    }
+                    protobuf::scalar_time64_value::Value::Time64NanosecondValue(t) => {
+                        Self::Time64Nanosecond(Some(*t))
+                    }
+                }
+            }
             Value::IntervalYearmonthValue(v) => Self::IntervalYearMonth(Some(*v)),
             Value::IntervalDaytimeValue(v) => Self::IntervalDayTime(Some(*v)),
             Value::TimestampValue(v) => {

@@ -21,7 +21,7 @@
 //! projection expressions. `SELECT` without `FROM` will only evaluate expressions.
 
 use std::any::Any;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -40,6 +40,7 @@ use super::expressions::{Column, PhysicalSortExpr};
 use super::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use super::{RecordBatchStream, SendableRecordBatchStream, Statistics};
 use crate::execution::context::TaskContext;
+use datafusion_physical_expr::equivalence::project_equivalence_properties;
 use datafusion_physical_expr::normalize_out_expr_with_alias_schema;
 use futures::stream::Stream;
 use futures::stream::StreamExt;
@@ -48,7 +49,7 @@ use futures::stream::StreamExt;
 #[derive(Debug)]
 pub struct ProjectionExec {
     /// The projection expressions stored as tuples of (expression, output column name)
-    expr: Vec<(Arc<dyn PhysicalExpr>, String)>,
+    pub(crate) expr: Vec<(Arc<dyn PhysicalExpr>, String)>,
     /// The schema once the projection has been applied to the input
     schema: SchemaRef,
     /// The input plan
@@ -78,7 +79,9 @@ impl ProjectionExec {
                     e.data_type(&input_schema)?,
                     e.nullable(&input_schema)?,
                 );
-                field.set_metadata(get_field_metadata(e, &input_schema));
+                field.set_metadata(
+                    get_field_metadata(e, &input_schema).unwrap_or_default(),
+                );
 
                 Ok(field)
             })
@@ -191,15 +194,14 @@ impl ExecutionPlan for ProjectionExec {
         true
     }
 
-    // Equivalence properties need to be adjusted after the Projection.
-    // 1) Add Alias, Alias can introduce additional equivalence properties,
-    //    For example:  Projection(a, a as a1, a as a2)
-    // 2) Truncate the properties that are not in the schema of the Projection
     fn equivalence_properties(&self) -> EquivalenceProperties {
-        let mut input_equivalence_properties = self.input.equivalence_properties();
-        input_equivalence_properties.merge_properties_with_alias(&self.alias_map);
-        input_equivalence_properties.truncate_properties_not_in_schema(&self.schema);
-        input_equivalence_properties
+        let mut new_properties = EquivalenceProperties::new(self.schema());
+        project_equivalence_properties(
+            self.input.equivalence_properties(),
+            &self.alias_map,
+            &mut new_properties,
+        );
+        new_properties
     }
 
     fn with_new_children(
@@ -268,7 +270,7 @@ impl ExecutionPlan for ProjectionExec {
 fn get_field_metadata(
     e: &Arc<dyn PhysicalExpr>,
     input_schema: &Schema,
-) -> Option<BTreeMap<String, String>> {
+) -> Option<HashMap<String, String>> {
     let name = if let Some(column) = e.as_any().downcast_ref::<Column>() {
         column.name()
     } else {
@@ -278,7 +280,7 @@ fn get_field_metadata(
     input_schema
         .field_with_name(name)
         .ok()
-        .and_then(|f| f.metadata().cloned())
+        .map(|f| f.metadata().clone())
 }
 
 fn stats_projection(
@@ -384,7 +386,7 @@ mod tests {
             ProjectionExec::try_new(vec![(col("c1", &schema)?, "c1".to_string())], csv)?;
 
         let col_field = projection.schema.field(0);
-        let col_metadata = col_field.metadata().unwrap().clone();
+        let col_metadata = col_field.metadata();
         let data: &str = &col_metadata["testing"];
         assert_eq!(data, "test");
 

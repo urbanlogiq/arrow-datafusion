@@ -48,9 +48,9 @@ use arrow::{
 use datafusion_common::{downcast_value, ScalarValue};
 use datafusion_expr::expr::{BinaryExpr, Cast};
 use datafusion_expr::expr_rewriter::{ExprRewritable, ExprRewriter};
-use datafusion_expr::utils::expr_to_columns;
 use datafusion_expr::{binary_expr, cast, try_cast, ExprSchemable};
 use datafusion_physical_expr::create_physical_expr;
+use datafusion_physical_expr::expressions::Literal;
 use log::trace;
 
 /// Interface to pass statistics information to [`PruningPredicate`]
@@ -223,6 +223,15 @@ impl PruningPredicate {
     /// Returns a reference to the predicate expr
     pub fn predicate_expr(&self) -> &Arc<dyn PhysicalExpr> {
         &self.predicate_expr
+    }
+
+    /// Returns true if this pruning predicate is "always true" (aka will not prune anything)
+    pub fn allways_true(&self) -> bool {
+        self.predicate_expr
+            .as_any()
+            .downcast_ref::<Literal>()
+            .map(|l| matches!(l.value(), ScalarValue::Boolean(Some(true))))
+            .unwrap_or_default()
     }
 
     /// Returns all need column indexes to evaluate this pruning predicate
@@ -445,10 +454,8 @@ impl<'a> PruningExpressionBuilder<'a> {
         required_columns: &'a mut RequiredStatColumns,
     ) -> Result<Self> {
         // find column name; input could be a more complicated expression
-        let mut left_columns = HashSet::<Column>::new();
-        expr_to_columns(left, &mut left_columns)?;
-        let mut right_columns = HashSet::<Column>::new();
-        expr_to_columns(right, &mut right_columns)?;
+        let left_columns = left.to_columns()?;
+        let right_columns = right.to_columns()?;
         let (column_expr, scalar_expr, columns, correct_operator) =
             match (left_columns.len(), right_columns.len()) {
                 (1, 0) => (left, right, left_columns, op),
@@ -733,8 +740,7 @@ fn build_predicate_expression(
     required_columns: &mut RequiredStatColumns,
 ) -> Result<Expr> {
     // Returned for unsupported expressions. Such expressions are
-    // converted to TRUE. This can still be useful when multiple
-    // conditions are joined using AND such as: column > 10 AND TRUE
+    // converted to TRUE.
     let unhandled = lit(true);
 
     // predicate expression can only be a binary expression
@@ -782,7 +788,16 @@ fn build_predicate_expression(
     if op == Operator::And || op == Operator::Or {
         let left_expr = build_predicate_expression(left, schema, required_columns)?;
         let right_expr = build_predicate_expression(right, schema, required_columns)?;
-        return Ok(binary_expr(left_expr, op, right_expr));
+        // simplify boolean expression if applicable
+        let expr = match (&left_expr, op, &right_expr) {
+            (left, Operator::And, _) if *left == unhandled => right_expr,
+            (_, Operator::And, right) if *right == unhandled => left_expr,
+            (left, Operator::Or, right) if *left == unhandled || *right == unhandled => {
+                unhandled
+            }
+            _ => binary_expr(left_expr, op, right_expr),
+        };
+        return Ok(expr);
     }
 
     let expr_builder =
@@ -897,7 +912,7 @@ mod tests {
             min: impl IntoIterator<Item = Option<i128>>,
             max: impl IntoIterator<Item = Option<i128>>,
             precision: u8,
-            scale: u8,
+            scale: i8,
         ) -> Self {
             Self {
                 min: Arc::new(
@@ -1398,7 +1413,7 @@ mod tests {
         ]);
         // test AND operator joining supported c1 < 1 expression and unsupported c2 > c3 expression
         let expr = col("c1").lt(lit(1)).and(col("c2").lt(col("c3")));
-        let expected_expr = "c1_min < Int32(1) AND Boolean(true)";
+        let expected_expr = "c1_min < Int32(1)";
         let predicate_expr =
             build_predicate_expression(&expr, &schema, &mut RequiredStatColumns::new())?;
         assert_eq!(format!("{:?}", predicate_expr), expected_expr);
@@ -1414,7 +1429,7 @@ mod tests {
         ]);
         // test OR operator joining supported c1 < 1 expression and unsupported c2 % 2 expression
         let expr = col("c1").lt(lit(1)).or(col("c2").modulus(lit(2)));
-        let expected_expr = "c1_min < Int32(1) OR Boolean(true)";
+        let expected_expr = "Boolean(true)";
         let predicate_expr =
             build_predicate_expression(&expr, &schema, &mut RequiredStatColumns::new())?;
         assert_eq!(format!("{:?}", predicate_expr), expected_expr);

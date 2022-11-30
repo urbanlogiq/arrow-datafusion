@@ -20,9 +20,11 @@
 use datafusion_common::DataFusionError;
 
 pub mod bytes;
+mod common;
 pub mod from_proto;
 pub mod generated;
 pub mod logical_plan;
+pub mod physical_plan;
 pub mod to_proto;
 
 pub use generated::datafusion as protobuf;
@@ -172,13 +174,16 @@ mod roundtrip_tests {
         fn try_decode_table_provider(
             &self,
             buf: &[u8],
-            _schema: SchemaRef,
+            schema: SchemaRef,
             _ctx: &SessionContext,
         ) -> Result<Arc<dyn TableProvider>, DataFusionError> {
             let msg = TestTableProto::decode(buf).map_err(|_| {
                 DataFusionError::Internal("Error decoding test table".to_string())
             })?;
-            let provider = TestTableProvider { url: msg.url };
+            let provider = TestTableProvider {
+                url: msg.url,
+                schema,
+            };
             Ok(Arc::new(provider))
         }
 
@@ -205,7 +210,7 @@ mod roundtrip_tests {
     async fn roundtrip_custom_tables() -> Result<(), DataFusionError> {
         let mut table_factories: HashMap<String, Arc<dyn TableProviderFactory>> =
             HashMap::new();
-        table_factories.insert("testtable".to_string(), Arc::new(TestTableFactory {}));
+        table_factories.insert("TESTTABLE".to_string(), Arc::new(TestTableFactory {}));
         let cfg = RuntimeConfig::new().with_table_factories(table_factories);
         let env = RuntimeEnv::new(cfg).unwrap();
         let ses = SessionConfig::new();
@@ -243,8 +248,6 @@ mod roundtrip_tests {
             "SELECT a, SUM(b + 1) as b_sum FROM t1 GROUP BY a ORDER BY b_sum DESC";
         let plan = ctx.sql(query).await?.to_logical_plan()?;
 
-        println!("{:?}", plan);
-
         let bytes = logical_plan_to_bytes(&plan)?;
         let logical_round_trip = logical_plan_from_bytes(&bytes, &ctx)?;
         assert_eq!(format!("{:?}", plan), format!("{:?}", logical_round_trip));
@@ -270,8 +273,6 @@ mod roundtrip_tests {
 
         let query = "SELECT a, COUNT(DISTINCT b) as b_cd FROM t1 GROUP BY a";
         let plan = ctx.sql(query).await?.to_logical_plan()?;
-
-        println!("{:?}", plan);
 
         let bytes = logical_plan_to_bytes(&plan)?;
         let logical_round_trip = logical_plan_from_bytes(&bytes, &ctx)?;
@@ -607,9 +608,21 @@ mod roundtrip_tests {
             ScalarValue::Date32(Some(0)),
             ScalarValue::Date32(Some(i32::MAX)),
             ScalarValue::Date32(None),
-            ScalarValue::Time64(Some(0)),
-            ScalarValue::Time64(Some(i64::MAX)),
-            ScalarValue::Time64(None),
+            ScalarValue::Date64(Some(0)),
+            ScalarValue::Date64(Some(i64::MAX)),
+            ScalarValue::Date64(None),
+            ScalarValue::Time32Second(Some(0)),
+            ScalarValue::Time32Second(Some(i32::MAX)),
+            ScalarValue::Time32Second(None),
+            ScalarValue::Time32Millisecond(Some(0)),
+            ScalarValue::Time32Millisecond(Some(i32::MAX)),
+            ScalarValue::Time32Millisecond(None),
+            ScalarValue::Time64Microsecond(Some(0)),
+            ScalarValue::Time64Microsecond(Some(i64::MAX)),
+            ScalarValue::Time64Microsecond(None),
+            ScalarValue::Time64Nanosecond(Some(0)),
+            ScalarValue::Time64Nanosecond(Some(i64::MAX)),
+            ScalarValue::Time64Nanosecond(None),
             ScalarValue::TimestampNanosecond(Some(0), None),
             ScalarValue::TimestampNanosecond(Some(i64::MAX), None),
             ScalarValue::TimestampNanosecond(Some(0), Some("UTC".to_string())),
@@ -801,7 +814,7 @@ mod roundtrip_tests {
             DataType::LargeBinary,
             DataType::Utf8,
             DataType::LargeUtf8,
-            DataType::Decimal128(123, 234),
+            DataType::Decimal128(7, 12),
             // Recursive list tests
             DataType::List(new_box_field("Level1", DataType::Binary, true)),
             DataType::List(new_box_field(
@@ -1214,6 +1227,10 @@ mod roundtrip_tests {
 
             fn evaluate(&self) -> datafusion::error::Result<ScalarValue> {
                 Ok(ScalarValue::Float64(None))
+            }
+
+            fn size(&self) -> usize {
+                std::mem::size_of_val(self)
             }
         }
 

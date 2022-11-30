@@ -19,7 +19,7 @@
 
 use std::sync::Arc;
 
-use arrow::datatypes::{Schema, SchemaRef};
+use arrow::datatypes::{DataType, Schema, SchemaRef};
 
 use crate::datasource::file_format::avro::DEFAULT_AVRO_EXTENSION;
 use crate::datasource::file_format::csv::DEFAULT_CSV_EXTENSION;
@@ -58,8 +58,7 @@ pub struct CsvReadOptions<'a> {
     /// Defaults to `FileType::CSV.get_ext().as_str()`.
     pub file_extension: &'a str,
     /// Partition Columns
-    pub table_partition_cols: Vec<String>,
-
+    pub table_partition_cols: Vec<(String, DataType)>,
     /// File compression type
     pub file_compression_type: FileCompressionType,
 }
@@ -117,7 +116,10 @@ impl<'a> CsvReadOptions<'a> {
     }
 
     /// Specify table_partition_cols for partition pruning
-    pub fn table_partition_cols(mut self, table_partition_cols: Vec<String>) -> Self {
+    pub fn table_partition_cols(
+        mut self,
+        table_partition_cols: Vec<(String, DataType)>,
+    ) -> Self {
         self.table_partition_cols = table_partition_cols;
         self
     }
@@ -145,13 +147,10 @@ impl<'a> CsvReadOptions<'a> {
             .with_schema_infer_max_rec(Some(self.schema_infer_max_records))
             .with_file_compression_type(self.file_compression_type.to_owned());
 
-        ListingOptions {
-            format: Arc::new(file_format),
-            collect_stat: false,
-            file_extension: self.file_extension.to_owned(),
-            target_partitions,
-            table_partition_cols: self.table_partition_cols.clone(),
-        }
+        ListingOptions::new(Arc::new(file_format))
+            .with_file_extension(self.file_extension)
+            .with_target_partitions(target_partitions)
+            .with_table_partition_cols(self.table_partition_cols.clone())
     }
 }
 
@@ -167,7 +166,7 @@ pub struct ParquetReadOptions<'a> {
     /// Defaults to ".parquet".
     pub file_extension: &'a str,
     /// Partition Columns
-    pub table_partition_cols: Vec<String>,
+    pub table_partition_cols: Vec<(String, DataType)>,
     /// Should DataFusion parquet reader use the predicate to prune data,
     /// overridden by value on execution::context::SessionConfig
     // TODO move this into ConfigOptions
@@ -208,7 +207,10 @@ impl<'a> ParquetReadOptions<'a> {
     }
 
     /// Specify table_partition_cols for partition pruning
-    pub fn table_partition_cols(mut self, table_partition_cols: Vec<String>) -> Self {
+    pub fn table_partition_cols(
+        mut self,
+        table_partition_cols: Vec<(String, DataType)>,
+    ) -> Self {
         self.table_partition_cols = table_partition_cols;
         self
     }
@@ -219,13 +221,10 @@ impl<'a> ParquetReadOptions<'a> {
             .with_enable_pruning(self.parquet_pruning)
             .with_skip_metadata(self.skip_metadata);
 
-        ListingOptions {
-            format: Arc::new(file_format),
-            collect_stat: true,
-            file_extension: self.file_extension.to_owned(),
-            target_partitions,
-            table_partition_cols: self.table_partition_cols.clone(),
-        }
+        ListingOptions::new(Arc::new(file_format))
+            .with_file_extension(self.file_extension)
+            .with_target_partitions(target_partitions)
+            .with_table_partition_cols(self.table_partition_cols.clone())
     }
 }
 
@@ -244,7 +243,7 @@ pub struct AvroReadOptions<'a> {
     /// Defaults to `FileType::AVRO.get_ext().as_str()`.
     pub file_extension: &'a str,
     /// Partition Columns
-    pub table_partition_cols: Vec<String>,
+    pub table_partition_cols: Vec<(String, DataType)>,
 }
 
 impl<'a> Default for AvroReadOptions<'a> {
@@ -259,7 +258,10 @@ impl<'a> Default for AvroReadOptions<'a> {
 
 impl<'a> AvroReadOptions<'a> {
     /// Specify table_partition_cols for partition pruning
-    pub fn table_partition_cols(mut self, table_partition_cols: Vec<String>) -> Self {
+    pub fn table_partition_cols(
+        mut self,
+        table_partition_cols: Vec<(String, DataType)>,
+    ) -> Self {
         self.table_partition_cols = table_partition_cols;
         self
     }
@@ -268,13 +270,10 @@ impl<'a> AvroReadOptions<'a> {
     pub fn to_listing_options(&self, target_partitions: usize) -> ListingOptions {
         let file_format = AvroFormat::default();
 
-        ListingOptions {
-            format: Arc::new(file_format),
-            collect_stat: false,
-            file_extension: self.file_extension.to_owned(),
-            target_partitions,
-            table_partition_cols: self.table_partition_cols.clone(),
-        }
+        ListingOptions::new(Arc::new(file_format))
+            .with_file_extension(self.file_extension)
+            .with_target_partitions(target_partitions)
+            .with_table_partition_cols(self.table_partition_cols.clone())
     }
 }
 
@@ -288,16 +287,13 @@ impl<'a> AvroReadOptions<'a> {
 pub struct NdJsonReadOptions<'a> {
     /// The data source schema.
     pub schema: Option<SchemaRef>,
-
     /// Max number of rows to read from JSON files for schema inference if needed. Defaults to `DEFAULT_SCHEMA_INFER_MAX_RECORD`.
     pub schema_infer_max_records: usize,
-
     /// File extension; only files with this extension are selected for data input.
     /// Defaults to `FileType::JSON.get_ext().as_str()`.
     pub file_extension: &'a str,
     /// Partition Columns
-    pub table_partition_cols: Vec<String>,
-
+    pub table_partition_cols: Vec<(String, DataType)>,
     /// File compression type
     pub file_compression_type: FileCompressionType,
 }
@@ -316,7 +312,10 @@ impl<'a> Default for NdJsonReadOptions<'a> {
 
 impl<'a> NdJsonReadOptions<'a> {
     /// Specify table_partition_cols for partition pruning
-    pub fn table_partition_cols(mut self, table_partition_cols: Vec<String>) -> Self {
+    pub fn table_partition_cols(
+        mut self,
+        table_partition_cols: Vec<(String, DataType)>,
+    ) -> Self {
         self.table_partition_cols = table_partition_cols;
         self
     }
@@ -340,12 +339,10 @@ impl<'a> NdJsonReadOptions<'a> {
     pub fn to_listing_options(&self, target_partitions: usize) -> ListingOptions {
         let file_format = JsonFormat::default()
             .with_file_compression_type(self.file_compression_type.to_owned());
-        ListingOptions {
-            format: Arc::new(file_format),
-            collect_stat: false,
-            file_extension: self.file_extension.to_owned(),
-            target_partitions,
-            table_partition_cols: self.table_partition_cols.clone(),
-        }
+
+        ListingOptions::new(Arc::new(file_format))
+            .with_file_extension(self.file_extension)
+            .with_target_partitions(target_partitions)
+            .with_table_partition_cols(self.table_partition_cols.clone())
     }
 }

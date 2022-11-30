@@ -20,8 +20,8 @@
 
 pub mod aggregate_statistics;
 pub mod coalesce_batches;
-pub mod hash_build_probe_order;
-pub mod merge_exec;
+pub mod enforcement;
+pub mod join_selection;
 pub mod optimizer;
 pub mod pruning;
 pub mod repartition;

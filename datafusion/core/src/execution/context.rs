@@ -22,18 +22,12 @@ use crate::{
         information_schema::CatalogWithInformationSchema,
     },
     datasource::listing::{ListingOptions, ListingTable},
-    datasource::{
-        file_format::{
-            avro::AvroFormat, csv::CsvFormat, json::JsonFormat, parquet::ParquetFormat,
-            FileFormat,
-        },
-        MemTable, ViewTable,
-    },
+    datasource::{MemTable, ViewTable},
     logical_expr::{PlanType, ToStringifiedPlan},
     optimizer::optimizer::Optimizer,
     physical_optimizer::{
-        aggregate_statistics::AggregateStatistics,
-        hash_build_probe_order::HashBuildProbeOrder, optimizer::PhysicalOptimizerRule,
+        aggregate_statistics::AggregateStatistics, join_selection::JoinSelection,
+        optimizer::PhysicalOptimizerRule,
     },
 };
 pub use datafusion_physical_expr::execution_props::ExecutionProps;
@@ -73,15 +67,14 @@ use crate::optimizer::optimizer::{OptimizerConfig, OptimizerRule};
 use datafusion_sql::{ResolvedTableReference, TableReference};
 
 use crate::physical_optimizer::coalesce_batches::CoalesceBatches;
-use crate::physical_optimizer::merge_exec::AddCoalescePartitionsExec;
 use crate::physical_optimizer::repartition::Repartition;
 
 use crate::config::{
     ConfigOptions, OPT_BATCH_SIZE, OPT_COALESCE_BATCHES, OPT_COALESCE_TARGET_BATCH_SIZE,
     OPT_FILTER_NULL_JOIN_KEYS, OPT_OPTIMIZER_MAX_PASSES, OPT_OPTIMIZER_SKIP_FAILED_RULES,
 };
-use crate::datasource::file_format::file_type::{FileCompressionType, FileType};
 use crate::execution::{runtime_env::RuntimeEnv, FunctionRegistry};
+use crate::physical_optimizer::enforcement::BasicEnforcement;
 use crate::physical_plan::file_format::{plan_to_csv, plan_to_json, plan_to_parquet};
 use crate::physical_plan::planner::DefaultPhysicalPlanner;
 use crate::physical_plan::udaf::AggregateUDF;
@@ -252,12 +245,9 @@ impl SessionContext {
     pub async fn sql(&self, sql: &str) -> Result<Arc<DataFrame>> {
         let plan = self.create_logical_plan(sql)?;
         match plan {
-            LogicalPlan::CreateExternalTable(cmd) => match cmd.file_type.as_str() {
-                "PARQUET" | "CSV" | "JSON" | "AVRO" => {
-                    self.create_listing_table(&cmd).await
-                }
-                _ => self.create_custom_table(&cmd).await,
-            },
+            LogicalPlan::CreateExternalTable(cmd) => {
+                self.create_external_table(&cmd).await
+            }
 
             LogicalPlan::CreateMemoryTable(CreateMemoryTable {
                 name,
@@ -490,12 +480,33 @@ impl SessionContext {
         Ok(Arc::new(DataFrame::new(self.state.clone(), &plan)))
     }
 
-    async fn create_custom_table(
+    async fn create_external_table(
         &self,
         cmd: &CreateExternalTable,
     ) -> Result<Arc<DataFrame>> {
+        let table_provider: Arc<dyn TableProvider> =
+            self.create_custom_table(cmd).await?;
+
+        let table = self.table(cmd.name.as_str());
+        match (cmd.if_not_exists, table) {
+            (true, Ok(_)) => self.return_empty_dataframe(),
+            (_, Err(_)) => {
+                self.register_table(cmd.name.as_str(), table_provider)?;
+                self.return_empty_dataframe()
+            }
+            (false, Ok(_)) => Err(DataFusionError::Execution(format!(
+                "Table '{:?}' already exists",
+                cmd.name
+            ))),
+        }
+    }
+
+    async fn create_custom_table(
+        &self,
+        cmd: &CreateExternalTable,
+    ) -> Result<Arc<dyn TableProvider>> {
         let state = self.state.read().clone();
-        let file_type = cmd.file_type.to_lowercase();
+        let file_type = cmd.file_type.to_uppercase();
         let factory = &state
             .runtime_env
             .table_factories
@@ -507,79 +518,7 @@ impl SessionContext {
                 ))
             })?;
         let table = (*factory).create(&state, cmd).await?;
-        self.register_table(cmd.name.as_str(), table)?;
-        let plan = LogicalPlanBuilder::empty(false).build()?;
-        Ok(Arc::new(DataFrame::new(self.state.clone(), &plan)))
-    }
-
-    async fn create_listing_table(
-        &self,
-        cmd: &CreateExternalTable,
-    ) -> Result<Arc<DataFrame>> {
-        let file_compression_type =
-            match FileCompressionType::from_str(cmd.file_compression_type.as_str()) {
-                Ok(t) => t,
-                Err(_) => Err(DataFusionError::Execution(
-                    "Only known FileCompressionTypes can be ListingTables!".to_string(),
-                ))?,
-            };
-
-        let file_type = match FileType::from_str(cmd.file_type.as_str()) {
-            Ok(t) => t,
-            Err(_) => Err(DataFusionError::Execution(
-                "Only known FileTypes can be ListingTables!".to_string(),
-            ))?,
-        };
-
-        let file_extension =
-            file_type.get_ext_with_compression(file_compression_type.to_owned())?;
-
-        let file_format: Arc<dyn FileFormat> = match file_type {
-            FileType::CSV => Arc::new(
-                CsvFormat::default()
-                    .with_has_header(cmd.has_header)
-                    .with_delimiter(cmd.delimiter as u8)
-                    .with_file_compression_type(file_compression_type),
-            ),
-            FileType::PARQUET => Arc::new(ParquetFormat::default()),
-            FileType::AVRO => Arc::new(AvroFormat::default()),
-            FileType::JSON => Arc::new(
-                JsonFormat::default().with_file_compression_type(file_compression_type),
-            ),
-        };
-
-        let table = self.table(cmd.name.as_str());
-        match (cmd.if_not_exists, table) {
-            (true, Ok(_)) => self.return_empty_dataframe(),
-            (_, Err(_)) => {
-                // TODO make schema in CreateExternalTable optional instead of empty
-                let provided_schema = if cmd.schema.fields().is_empty() {
-                    None
-                } else {
-                    Some(Arc::new(cmd.schema.as_ref().to_owned().into()))
-                };
-                let options = ListingOptions {
-                    format: file_format,
-                    collect_stat: self.copied_config().collect_statistics,
-                    file_extension: file_extension.to_owned(),
-                    target_partitions: self.copied_config().target_partitions,
-                    table_partition_cols: cmd.table_partition_cols.clone(),
-                };
-                self.register_listing_table(
-                    cmd.name.as_str(),
-                    cmd.location.clone(),
-                    options,
-                    provided_schema,
-                    cmd.definition.clone(),
-                )
-                .await?;
-                self.return_empty_dataframe()
-            }
-            (false, Ok(_)) => Err(DataFusionError::Execution(format!(
-                "Table '{:?}' already exists",
-                cmd.name
-            ))),
-        }
+        Ok(table)
     }
 
     fn find_and_deregister<'a>(
@@ -807,7 +746,7 @@ impl SessionContext {
         table_path: impl AsRef<str>,
         options: ListingOptions,
         provided_schema: Option<SchemaRef>,
-        sql: Option<String>,
+        sql_definition: Option<String>,
     ) -> Result<()> {
         let table_path = ListingTableUrl::parse(table_path)?;
         let resolved_schema = match provided_schema {
@@ -817,7 +756,7 @@ impl SessionContext {
         let config = ListingTableConfig::new(table_path)
             .with_listing_options(options)
             .with_schema(resolved_schema);
-        let table = ListingTable::try_new(config)?.with_definition(sql);
+        let table = ListingTable::try_new(config)?.with_definition(sql_definition);
         self.register_table(name, Arc::new(table))?;
         Ok(())
     }
@@ -1566,8 +1505,9 @@ impl SessionState {
 
         let mut physical_optimizers: Vec<Arc<dyn PhysicalOptimizerRule + Sync + Send>> = vec![
             Arc::new(AggregateStatistics::new()),
-            Arc::new(HashBuildProbeOrder::new()),
+            Arc::new(JoinSelection::new()),
         ];
+        physical_optimizers.push(Arc::new(BasicEnforcement::new()));
         if config
             .config_options
             .read()
@@ -1585,7 +1525,9 @@ impl SessionState {
             )));
         }
         physical_optimizers.push(Arc::new(Repartition::new()));
-        physical_optimizers.push(Arc::new(AddCoalescePartitionsExec::new()));
+        // Repartition rule could introduce additional RepartitionExec with RoundRobin partitioning.
+        // To make sure the SinglePartition is satisfied, run the BasicEnforcement again, originally it was the AddCoalescePartitionsExec here.
+        physical_optimizers.push(Arc::new(BasicEnforcement::new()));
 
         SessionState {
             session_id,
@@ -1620,12 +1562,21 @@ impl SessionState {
         }
         let url = url.to_string();
         let format = format.to_string();
+
+        let has_header = config
+            .config_options
+            .read()
+            .get("datafusion.catalog.has_header");
+        let has_header: bool = has_header
+            .map(|x| FromStr::from_str(&x.to_string()).unwrap_or_default())
+            .unwrap_or_default();
+
         let url = Url::parse(url.as_str()).expect("Invalid default catalog location!");
         let authority = match url.host_str() {
             Some(host) => format!("{}://{}", url.scheme(), host),
             None => format!("{}://", url.scheme()),
         };
-        let path = &url.as_str()[authority.len() as usize..];
+        let path = &url.as_str()[authority.len()..];
         let path = object_store::path::Path::parse(path).expect("Can't parse path");
         let store = ObjectStoreUrl::parse(authority.as_str())
             .expect("Invalid default catalog url");
@@ -1637,7 +1588,14 @@ impl SessionState {
             Some(factory) => factory,
             _ => return,
         };
-        let schema = ListingSchemaProvider::new(authority, path, factory.clone(), store);
+        let schema = ListingSchemaProvider::new(
+            authority,
+            path,
+            factory.clone(),
+            store,
+            format,
+            has_header,
+        );
         let _ = default_catalog
             .register_schema("default", Arc::new(schema))
             .expect("Failed to register default schema");
@@ -1852,22 +1810,14 @@ impl FunctionRegistry for SessionState {
     }
 }
 
-/// Task Context Properties
-pub enum TaskProperties {
-    ///SessionConfig
-    SessionConfig(SessionConfig),
-    /// Name-value pairs of task properties
-    KVPairs(HashMap<String, String>),
-}
-
 /// Task Execution Context
 pub struct TaskContext {
     /// Session Id
     session_id: String,
     /// Optional Task Identify
     task_id: Option<String>,
-    /// Task properties
-    properties: TaskProperties,
+    /// Session configuration
+    session_config: SessionConfig,
     /// Scalar functions associated with this task context
     scalar_functions: HashMap<String, Arc<ScalarUDF>>,
     /// Aggregate functions associated with this task context
@@ -1886,10 +1836,43 @@ impl TaskContext {
         aggregate_functions: HashMap<String, Arc<AggregateUDF>>,
         runtime: Arc<RuntimeEnv>,
     ) -> Self {
+        let session_config = if task_props.is_empty() {
+            SessionConfig::new()
+        } else {
+            SessionConfig::new()
+                .with_batch_size(task_props.get(OPT_BATCH_SIZE).unwrap().parse().unwrap())
+                .with_target_partitions(
+                    task_props.get(TARGET_PARTITIONS).unwrap().parse().unwrap(),
+                )
+                .with_repartition_joins(
+                    task_props.get(REPARTITION_JOINS).unwrap().parse().unwrap(),
+                )
+                .with_repartition_aggregations(
+                    task_props
+                        .get(REPARTITION_AGGREGATIONS)
+                        .unwrap()
+                        .parse()
+                        .unwrap(),
+                )
+                .with_repartition_windows(
+                    task_props
+                        .get(REPARTITION_WINDOWS)
+                        .unwrap()
+                        .parse()
+                        .unwrap(),
+                )
+                .with_parquet_pruning(
+                    task_props.get(PARQUET_PRUNING).unwrap().parse().unwrap(),
+                )
+                .with_collect_statistics(
+                    task_props.get(COLLECT_STATISTICS).unwrap().parse().unwrap(),
+                )
+        };
+
         Self {
             task_id: Some(task_id),
             session_id,
-            properties: TaskProperties::KVPairs(task_props),
+            session_config,
             scalar_functions,
             aggregate_functions,
             runtime,
@@ -1897,44 +1880,8 @@ impl TaskContext {
     }
 
     /// Return the SessionConfig associated with the Task
-    pub fn session_config(&self) -> SessionConfig {
-        let task_props = &self.properties;
-        match task_props {
-            TaskProperties::KVPairs(props) => {
-                let session_config = SessionConfig::new();
-                if props.is_empty() {
-                    session_config
-                } else {
-                    session_config
-                        .with_batch_size(
-                            props.get(OPT_BATCH_SIZE).unwrap().parse().unwrap(),
-                        )
-                        .with_target_partitions(
-                            props.get(TARGET_PARTITIONS).unwrap().parse().unwrap(),
-                        )
-                        .with_repartition_joins(
-                            props.get(REPARTITION_JOINS).unwrap().parse().unwrap(),
-                        )
-                        .with_repartition_aggregations(
-                            props
-                                .get(REPARTITION_AGGREGATIONS)
-                                .unwrap()
-                                .parse()
-                                .unwrap(),
-                        )
-                        .with_repartition_windows(
-                            props.get(REPARTITION_WINDOWS).unwrap().parse().unwrap(),
-                        )
-                        .with_parquet_pruning(
-                            props.get(PARQUET_PRUNING).unwrap().parse().unwrap(),
-                        )
-                        .with_collect_statistics(
-                            props.get(COLLECT_STATISTICS).unwrap().parse().unwrap(),
-                        )
-                }
-            }
-            TaskProperties::SessionConfig(session_config) => session_config.clone(),
-        }
+    pub fn session_config(&self) -> &SessionConfig {
+        &self.session_config
     }
 
     /// Return the session_id of this [TaskContext]
@@ -1956,24 +1903,7 @@ impl TaskContext {
 /// Create a new task context instance from SessionContext
 impl From<&SessionContext> for TaskContext {
     fn from(session: &SessionContext) -> Self {
-        let session_id = session.session_id.clone();
-        let (config, scalar_functions, aggregate_functions) = {
-            let session_state = session.state.read();
-            (
-                session_state.config.clone(),
-                session_state.scalar_functions.clone(),
-                session_state.aggregate_functions.clone(),
-            )
-        };
-        let runtime = session.runtime_env();
-        Self {
-            task_id: None,
-            session_id,
-            properties: TaskProperties::SessionConfig(config),
-            scalar_functions,
-            aggregate_functions,
-            runtime,
-        }
+        TaskContext::from(&*session.state.read())
     }
 }
 
@@ -1981,14 +1911,14 @@ impl From<&SessionContext> for TaskContext {
 impl From<&SessionState> for TaskContext {
     fn from(state: &SessionState) -> Self {
         let session_id = state.session_id.clone();
-        let config = state.config.clone();
+        let session_config = state.config.clone();
         let scalar_functions = state.scalar_functions.clone();
         let aggregate_functions = state.aggregate_functions.clone();
         let runtime = state.runtime_env.clone();
         Self {
             task_id: None,
             session_id,
-            properties: TaskProperties::SessionConfig(config),
+            session_config,
             scalar_functions,
             aggregate_functions,
             runtime,
@@ -2028,8 +1958,6 @@ impl FunctionRegistry for TaskContext {
 mod tests {
     use super::*;
     use crate::assert_batches_eq;
-    use crate::datasource::datasource::TableProviderFactory;
-    use crate::datasource::listing_table_factory::ListingTableFactory;
     use crate::execution::context::QueryPlanner;
     use crate::execution::runtime_env::RuntimeConfig;
     use crate::physical_plan::expressions::AvgAccumulator;
@@ -2290,15 +2218,12 @@ mod tests {
         let path = path.join("tests/tpch-csv");
         let url = format!("file://{}", path.display());
 
-        let mut table_factories: HashMap<String, Arc<dyn TableProviderFactory>> =
-            HashMap::new();
-        let factory = Arc::new(ListingTableFactory::new(FileType::CSV));
-        table_factories.insert("test".to_string(), factory);
-        let rt_cfg = RuntimeConfig::new().with_table_factories(table_factories);
+        let rt_cfg = RuntimeConfig::new();
         let runtime = Arc::new(RuntimeEnv::new(rt_cfg).unwrap());
         let cfg = SessionConfig::new()
             .set_str("datafusion.catalog.location", url.as_str())
-            .set_str("datafusion.catalog.type", "test");
+            .set_str("datafusion.catalog.type", "CSV")
+            .set_str("datafusion.catalog.has_header", "true");
         let session_state = SessionState::with_config_rt(cfg, runtime);
         let ctx = SessionContext::with_state(session_state);
         ctx.refresh_catalogs().await?;
@@ -2644,7 +2569,7 @@ mod tests {
         // generate a partitioned file
         for partition in 0..partition_count {
             let filename = format!("partition-{}.{}", partition, file_extension);
-            let file_path = tmp_dir.path().join(&filename);
+            let file_path = tmp_dir.path().join(filename);
             let mut file = File::create(file_path)?;
 
             // generate some data

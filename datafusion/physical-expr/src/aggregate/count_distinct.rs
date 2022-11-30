@@ -182,8 +182,7 @@ impl Accumulator for DistinctCountAccumulator {
             .state_data_types
             .iter()
             .map(|state_data_type| {
-                let values = Box::new(Vec::new());
-                ScalarValue::new_list(Some(*values), state_data_type.clone())
+                ScalarValue::new_list(Some(Vec::new()), state_data_type.clone())
             })
             .collect::<Vec<_>>();
 
@@ -219,6 +218,20 @@ impl Accumulator for DistinctCountAccumulator {
             ))),
         }
     }
+
+    fn size(&self) -> usize {
+        // TODO(crepererum): `DataType` is NOT fixed size, add `DataType::size` method to arrow (https://github.com/apache/arrow-rs/issues/3147)
+        std::mem::size_of_val(self)
+            + (std::mem::size_of::<DistinctScalarValues>() * self.values.capacity())
+            + self
+                .values
+                .iter()
+                .map(|vals| {
+                    ScalarValue::size_of_vec(&vals.0) - std::mem::size_of_val(&vals.0)
+                })
+                .sum::<usize>()
+            + (std::mem::size_of::<DataType>() * self.state_data_types.capacity())
+    }
 }
 
 #[cfg(test)]
@@ -227,11 +240,11 @@ mod tests {
     use crate::aggregate::utils::get_accum_scalar_values;
     use arrow::array::{
         ArrayRef, BooleanArray, Float32Array, Float64Array, Int16Array, Int32Array,
-        Int64Array, Int8Array, ListArray, UInt16Array, UInt32Array, UInt64Array,
-        UInt8Array,
+        Int64Array, Int8Array, UInt16Array, UInt32Array, UInt64Array, UInt8Array,
     };
     use arrow::array::{Int32Builder, ListBuilder, UInt64Builder};
     use arrow::datatypes::DataType;
+    use datafusion_common::cast::as_list_array;
 
     macro_rules! state_to_vec {
         ($LIST:expr, $DATA_TYPE:ident, $PRIM_TY:ty) => {{
@@ -381,7 +394,7 @@ mod tests {
         let agg = DistinctCount::new(
             arrays
                 .iter()
-                .map(|a| a.as_any().downcast_ref::<ListArray>().unwrap())
+                .map(|a| as_list_array(a).unwrap())
                 .map(|a| a.values().data_type().clone())
                 .collect::<Vec<_>>(),
             vec![],
@@ -410,7 +423,6 @@ mod tests {
 
     macro_rules! test_count_distinct_update_batch_floating_point {
         ($ARRAY_TYPE:ident, $DATA_TYPE:ident, $PRIM_TYPE:ty) => {{
-            use ordered_float::OrderedFloat;
             let values: Vec<Option<$PRIM_TYPE>> = vec![
                 Some(<$PRIM_TYPE>::INFINITY),
                 Some(<$PRIM_TYPE>::NAN),
@@ -437,10 +449,10 @@ mod tests {
 
             let mut state_vec =
                 state_to_vec!(&states[0], $DATA_TYPE, $PRIM_TYPE).unwrap();
+
+            dbg!(&state_vec);
             state_vec.sort_by(|a, b| match (a, b) {
-                (Some(lhs), Some(rhs)) => {
-                    OrderedFloat::from(*lhs).cmp(&OrderedFloat::from(*rhs))
-                }
+                (Some(lhs), Some(rhs)) => lhs.total_cmp(rhs),
                 _ => a.partial_cmp(b).unwrap(),
             });
 

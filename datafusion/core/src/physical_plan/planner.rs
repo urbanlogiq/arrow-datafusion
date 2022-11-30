@@ -23,7 +23,9 @@ use super::{
     aggregates, empty::EmptyExec, joins::PartitionMode, udaf, union::UnionExec,
     values::ValuesExec, windows,
 };
-use crate::config::{OPT_EXPLAIN_LOGICAL_PLAN_ONLY, OPT_EXPLAIN_PHYSICAL_PLAN_ONLY};
+use crate::config::{
+    OPT_EXPLAIN_LOGICAL_PLAN_ONLY, OPT_EXPLAIN_PHYSICAL_PLAN_ONLY, OPT_PREFER_HASH_JOIN,
+};
 use crate::datasource::source_as_provider;
 use crate::execution::context::{ExecutionProps, SessionState};
 use crate::logical_expr::utils::generate_sort_key;
@@ -44,6 +46,7 @@ use crate::physical_plan::expressions::{Column, PhysicalSortExpr};
 use crate::physical_plan::filter::FilterExec;
 use crate::physical_plan::joins::CrossJoinExec;
 use crate::physical_plan::joins::HashJoinExec;
+use crate::physical_plan::joins::SortMergeJoinExec;
 use crate::physical_plan::limit::{GlobalLimitExec, LocalLimitExec};
 use crate::physical_plan::projection::ProjectionExec;
 use crate::physical_plan::repartition::RepartitionExec;
@@ -63,8 +66,8 @@ use datafusion_expr::expr::{
     Between, BinaryExpr, Cast, GetIndexedField, GroupingSet, Like,
 };
 use datafusion_expr::expr_rewriter::unnormalize_cols;
-use datafusion_expr::utils::{expand_wildcard, expr_to_columns};
-use datafusion_expr::{WindowFrame, WindowFrameBound, WindowFrameUnits};
+use datafusion_expr::utils::expand_wildcard;
+use datafusion_expr::{WindowFrame, WindowFrameBound};
 use datafusion_optimizer::utils::unalias;
 use datafusion_physical_expr::expressions::Literal;
 use datafusion_sql::utils::window_expr_common_partition_keys;
@@ -72,7 +75,7 @@ use futures::future::BoxFuture;
 use futures::{FutureExt, StreamExt, TryStreamExt};
 use itertools::Itertools;
 use log::{debug, trace};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fmt::Write;
 use std::sync::Arc;
 
@@ -539,19 +542,6 @@ impl DefaultPhysicalPlanner {
                         vec![]
                     };
 
-                    let input_exec = if can_repartition {
-                        Arc::new(RepartitionExec::try_new(
-                            input_exec,
-                            Partitioning::Hash(
-                                physical_partition_keys.clone(),
-                                session_state.config.target_partitions,
-                            ),
-                        )?)
-                    } else {
-                        input_exec
-                    };
-
-                    // add a sort phase
                     let get_sort_keys = |expr: &Expr| match expr {
                         Expr::WindowFunction {
                             ref partition_by,
@@ -609,16 +599,6 @@ impl DefaultPhysicalPlanner {
                         Some(sort_keys)
                     };
 
-                    let input_exec = match physical_sort_keys.clone() {
-                        None => input_exec,
-                        Some(sort_exprs) => {
-                            if can_repartition {
-                                Arc::new(SortExec::new_with_partitioning(sort_exprs, input_exec, true, None))
-                            } else {
-                                Arc::new(SortExec::try_new(sort_exprs, input_exec, None)?)
-                            }
-                        },
-                    };
                     let physical_input_schema = input_exec.schema();
                     let window_expr = window_expr
                         .iter()
@@ -688,16 +668,8 @@ impl DefaultPhysicalPlanner {
                         Arc<dyn ExecutionPlan>,
                         AggregateMode,
                     ) = if can_repartition {
-                        // Divide partial hash aggregates into multiple partitions by hash key
-                        let hash_repartition = Arc::new(RepartitionExec::try_new(
-                            initial_aggr,
-                            Partitioning::Hash(
-                                final_group.clone(),
-                                session_state.config.target_partitions,
-                            ),
-                        )?);
-                        // Combine hash aggregates within the partition
-                        (hash_repartition, AggregateMode::FinalPartitioned)
+                        // construct a second aggregation with 'AggregateMode::FinalPartitioned'
+                        (initial_aggr, AggregateMode::FinalPartitioned)
                     } else {
                         // construct a second aggregation, keeping the final column name equal to the
                         // first aggregation and the expressions corresponding to the respective aggregate
@@ -742,7 +714,7 @@ impl DefaultPhysicalPlanner {
                             // provided expressions into logical Column expressions if their results
                             // are already provided from the input plans. Because we work with
                             // qualified columns in logical plane, derived columns involve operators or
-                            // functions will contain qualifers as well. This will result in logical
+                            // functions will contain qualifiers as well. This will result in logical
                             // columns with names like `SUM(t1.c1)`, `t1.c1 + t1.c2`, etc.
                             //
                             // If we run these logical columns through physical_name function, we will
@@ -906,8 +878,7 @@ impl DefaultPhysicalPlanner {
                     let join_filter = match filter {
                         Some(expr) => {
                             // Extract columns from filter expression
-                            let mut cols = HashSet::new();
-                            expr_to_columns(expr, &mut cols)?;
+                            let cols = expr.to_columns()?;
 
                             // Collect left & right field indices
                             let left_field_indices = cols.iter()
@@ -962,39 +933,47 @@ impl DefaultPhysicalPlanner {
                         _ => None
                     };
 
+                    let prefer_hash_join = session_state.config.config_options()
+                        .read()
+                        .get_bool(OPT_PREFER_HASH_JOIN)
+                        .unwrap_or_default();
                     if session_state.config.target_partitions > 1
                         && session_state.config.repartition_joins
+                        && !prefer_hash_join
                     {
-                        let (left_expr, right_expr) = join_on
-                            .iter()
-                            .map(|(l, r)| {
-                                (
-                                    Arc::new(l.clone()) as Arc<dyn PhysicalExpr>,
-                                    Arc::new(r.clone()) as Arc<dyn PhysicalExpr>,
-                                )
-                            })
-                            .unzip();
-
-                        // Use hash partition by default to parallelize hash joins
-                        Ok(Arc::new(HashJoinExec::try_new(
-                            Arc::new(RepartitionExec::try_new(
+                        // Use SortMergeJoin if hash join is not preferred
+                        // Sort-Merge join support currently is experimental
+                        if join_filter.is_some() {
+                            // TODO SortMergeJoinExec need to support join filter
+                            Err(DataFusionError::NotImplemented("SortMergeJoinExec does not support join_filter now.".to_string()))
+                        } else {
+                            let join_on_len = join_on.len();
+                            Ok(Arc::new(SortMergeJoinExec::try_new(
                                 physical_left,
-                                Partitioning::Hash(
-                                    left_expr,
-                                    session_state.config.target_partitions,
-                                ),
-                            )?),
-                            Arc::new(RepartitionExec::try_new(
                                 physical_right,
-                                Partitioning::Hash(
-                                    right_expr,
-                                    session_state.config.target_partitions,
-                                ),
-                            )?),
+                                join_on,
+                                *join_type,
+                                vec![SortOptions::default(); join_on_len],
+                                *null_equals_null,
+                            )?))
+                        }
+                    } else if session_state.config.target_partitions > 1
+                        && session_state.config.repartition_joins
+                        && prefer_hash_join {
+                         let partition_mode = {
+                            if session_state.config.collect_statistics {
+                                PartitionMode::Auto
+                            } else {
+                                PartitionMode::Partitioned
+                            }
+                         };
+                        Ok(Arc::new(HashJoinExec::try_new(
+                            physical_left,
+                            physical_right,
                             join_on,
                             join_filter,
                             join_type,
-                            PartitionMode::Partitioned,
+                            partition_mode,
                             null_equals_null,
                         )?))
                     } else {
@@ -1023,12 +1002,7 @@ impl DefaultPhysicalPlanner {
                     SchemaRef::new(schema.as_ref().to_owned().into()),
                 ))),
                 LogicalPlan::SubqueryAlias(SubqueryAlias { input, .. }) => {
-                    match input.as_ref() {
-                        LogicalPlan::TableScan(..) => {
-                            self.create_initial_plan(input, session_state).await
-                        }
-                        _ => Err(DataFusionError::Plan("SubqueryAlias should only wrap TableScan".to_string()))
-                    }
+                    self.create_initial_plan(input, session_state).await
                 }
                 LogicalPlan::Limit(Limit { input, skip, fetch, .. }) => {
                     let input = self.create_initial_plan(input, session_state).await?;
@@ -1511,12 +1485,6 @@ pub fn create_window_expr_with_name(
                 })
                 .collect::<Result<Vec<_>>>()?;
             if let Some(ref window_frame) = window_frame {
-                if window_frame.units == WindowFrameUnits::Groups {
-                    return Err(DataFusionError::NotImplemented(
-                        "Window frame definitions involving GROUPS are not supported yet"
-                            .to_string(),
-                    ));
-                }
                 if !is_window_valid(window_frame) {
                     return Err(DataFusionError::Execution(format!(
                         "Invalid window frame: start bound ({}) cannot be larger than end bound ({})",
@@ -1739,7 +1707,16 @@ impl DefaultPhysicalPlanner {
 
         let mut new_plan = plan;
         for optimizer in optimizers {
+            let before_schema = new_plan.schema();
             new_plan = optimizer.optimize(new_plan, &session_state.config)?;
+            if optimizer.schema_check() && new_plan.schema() != before_schema {
+                return Err(DataFusionError::Internal(format!(
+                        "PhysicalOptimizer rule '{}' failed, due to generate a different schema, original schema: {:?}, new schema: {:?}",
+                        optimizer.name(),
+                        before_schema,
+                        new_plan.schema()
+                    )));
+            }
             observer(new_plan.as_ref(), optimizer.as_ref())
         }
         debug!(
@@ -2020,7 +1997,7 @@ mod tests {
                 nullable: false, \
                 dict_id: 0, \
                 dict_is_ordered: false, \
-                metadata: None } }\
+                metadata: {} } }\
         ], metadata: {} }, \
         ExecutionPlan schema: Schema { fields: [\
             Field { \
@@ -2029,7 +2006,7 @@ mod tests {
                 nullable: false, \
                 dict_id: 0, \
                 dict_is_ordered: false, \
-                metadata: None }\
+                metadata: {} }\
         ], metadata: {} }";
         match plan {
             Ok(_) => panic!("Expected planning failure"),
@@ -2076,7 +2053,7 @@ mod tests {
             .build()?;
         let e = plan(&logical_plan).await.unwrap_err().to_string();
 
-        assert_contains!(&e, "The data type inlist should be same, the value type is Boolean, one of list expr type is Struct([Field { name: \"foo\", data_type: Boolean, nullable: false, dict_id: 0, dict_is_ordered: false, metadata: None }])");
+        assert_contains!(&e, "The data type inlist should be same, the value type is Boolean, one of list expr type is Struct([Field { name: \"foo\", data_type: Boolean, nullable: false, dict_id: 0, dict_is_ordered: false, metadata: {} }])");
 
         Ok(())
     }
@@ -2341,11 +2318,7 @@ mod tests {
             unimplemented!("NoOpExecutionPlan::execute");
         }
 
-        fn fmt_as(
-            &self,
-            t: DisplayFormatType,
-            f: &mut std::fmt::Formatter,
-        ) -> std::fmt::Result {
+        fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
             match t {
                 DisplayFormatType::Default => {
                     write!(f, "NoOpExecutionPlan")
