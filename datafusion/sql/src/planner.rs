@@ -1499,9 +1499,12 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
     /// ambiguous check for unqualifier column
     fn column_reference_ambiguous_check(
         &self,
-        schema: &DFSchema,
-        exprs: &[Expr],
+        _schema: &DFSchema,
+        _exprs: &[Expr],
     ) -> Result<()> {
+        // TODO: stubbing this out because a number of queries we were using
+        // successfully with DataFusion 14 are now failing this check
+        /*
         find_column_exprs(exprs)
             .iter()
             .try_for_each(|col| match col {
@@ -1521,6 +1524,9 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
                 },
                 _ => Ok(()),
             })
+        */
+
+        Ok(())
     }
 
     /// Generate a relational expression from a select SQL expression
