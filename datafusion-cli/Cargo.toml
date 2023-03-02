@@ -41,17 +41,3 @@ parking_lot = { version = "0.12" }
 rustyline = "10.0"
 tokio = { version = "1.24", features = ["macros", "rt", "rt-multi-thread", "sync", "parking_lot"] }
 url = "2.2"
-
-[patch.crates-io]
-arrow-buffer = { path = "/Users/max/src/external/arrow-rs/arrow-buffer" }
-arrow-row = { path = "/Users/max/src/external/arrow-rs/arrow-row" }
-arrow-array = { path = "/Users/max/src/external/arrow-rs/arrow-array" }
-arrow-schema = { path = "/Users/max/src/external/arrow-rs/arrow-schema" }
-arrow-arith = { path = "/Users/max/src/external/arrow-rs/arrow-arith" }
-arrow-select = { path = "/Users/max/src/external/arrow-rs/arrow-select" }
-arrow-ord = { path = "/Users/max/src/external/arrow-rs/arrow-ord" }
-arrow-string = { path = "/Users/max/src/external/arrow-rs/arrow-string" }
-arrow-cast = { path = "/Users/max/src/external/arrow-rs/arrow-cast" }
-arrow-ipc = { path = "/Users/max/src/external/arrow-rs/arrow-ipc" }
-arrow-json = { path = "/Users/max/src/external/arrow-rs/arrow-json" }
-arrow-data = { path = "/Users/max/src/external/arrow-rs/arrow-data" }
