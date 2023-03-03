@@ -23,10 +23,10 @@ use ahash::RandomState;
 use arrow::{
     array::{
         ArrayData, ArrayRef, BooleanArray, Date32Array, Date64Array, Decimal128Array,
-        DictionaryArray, LargeStringArray, PrimitiveArray, Time32MillisecondArray,
-        Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray,
-        TimestampMicrosecondArray, TimestampMillisecondArray, TimestampSecondArray,
-        UInt32BufferBuilder, UInt32Builder, UInt64BufferBuilder,
+        DictionaryArray, FixedSizeBinaryArray, LargeStringArray, PrimitiveArray,
+        Time32MillisecondArray, Time32SecondArray, Time64MicrosecondArray,
+        Time64NanosecondArray, TimestampMicrosecondArray, TimestampMillisecondArray,
+        TimestampSecondArray, UInt32BufferBuilder, UInt32Builder, UInt64BufferBuilder,
     },
     compute,
     datatypes::{
@@ -1054,6 +1054,9 @@ fn equal_rows(
             }
             DataType::LargeUtf8 => {
                 equal_rows_elem!(LargeStringArray, l, r, left, right, null_equals_null)
+            }
+            DataType::FixedSizeBinary(_) => {
+                equal_rows_elem!(FixedSizeBinaryArray, l, r, left, right, null_equals_null)
             }
             DataType::Decimal128(_, lscale) => match r.data_type() {
                 DataType::Decimal128(_, rscale) => {
