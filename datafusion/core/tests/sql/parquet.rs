@@ -147,6 +147,26 @@ async fn run_query_with_options(options: ListingOptions, num_files: usize) -> St
 }
 
 #[tokio::test]
+async fn fixed_size_binary_column_join() {
+    let ctx = SessionContext::new();
+    ctx.register_parquet(
+        "t0",
+        "tests/parquet/data/unsorted_fixed_size_binary.parquet",
+        ParquetReadOptions::default(),
+    )
+    .await
+    .unwrap();
+    let sql = "SELECT * FROM t0 INNER JOIN t0 AS t1 ON t0.journey_id = t1.journey_id";
+    let dataframe = ctx.sql(sql).await.unwrap();
+    let results = dataframe.collect().await.unwrap();
+    let mut num_rows = 0;
+    for batch in results {
+        num_rows += batch.num_rows();
+    }
+    assert_eq!(num_rows, 4096);
+}
+
+#[tokio::test]
 async fn fixed_size_binary_columns() {
     let ctx = SessionContext::new();
     ctx.register_parquet(
