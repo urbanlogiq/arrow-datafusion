@@ -390,6 +390,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
         schema: &DFSchema,
         fallback_schema: Option<&DFSchema>,
     ) -> Result<()> {
+        /*
         find_column_exprs(exprs)
             .iter()
             .try_for_each(|col| match col {
@@ -424,6 +425,8 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
                 }
                 _ => Ok(()),
             })
+        */
+        Ok(())
     }
 
     fn check_wildcard_options(options: WildcardAdditionalOptions) -> Result<()> {
