@@ -389,10 +389,13 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
     /// ambiguous check for unqualifier column
     fn column_reference_ambiguous_check(
         &self,
-        exprs: &[Expr],
-        schema: &DFSchema,
-        fallback_schema: Option<&DFSchema>,
+        _exprs: &[Expr],
+        _schema: &DFSchema,
+        _fallback_schema: Option<&DFSchema>,
     ) -> Result<()> {
+        // HACK: dashboard queries can generate "ambiguous column" errors so we patch this to disable those errors
+        // Would be great to solve this one day. Context: https://urbanlogiq.atlassian.net/browse/UB-3208
+        /*
         find_column_exprs(exprs)
             .iter()
             .try_for_each(|col| match col {
@@ -427,6 +430,8 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
                 }
                 _ => Ok(()),
             })
+        */
+        Ok(())
     }
 
     fn check_wildcard_options(options: WildcardAdditionalOptions) -> Result<()> {
