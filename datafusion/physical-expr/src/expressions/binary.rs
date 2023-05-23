@@ -980,6 +980,7 @@ macro_rules! binary_array_op_dyn_scalar {
             ScalarValue::TimestampMillisecond(v, _) => compute_op_dyn_scalar!($LEFT, v, $OP, $OP_TYPE),
             ScalarValue::TimestampMicrosecond(v, _) => compute_op_dyn_scalar!($LEFT, v, $OP, $OP_TYPE),
             ScalarValue::TimestampNanosecond(v, _) => compute_op_dyn_scalar!($LEFT, v, $OP, $OP_TYPE),
+            ScalarValue::FixedSizeBinary(_, v) => compute_binary_op_dyn_scalar!($LEFT, v, $OP, $OP_TYPE),
             other => Err(DataFusionError::Internal(format!(
                 "Data type {:?} not supported for scalar operation '{}' on dyn array",
                 other, stringify!($OP)))
