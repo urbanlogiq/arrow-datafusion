@@ -23,15 +23,15 @@ use std::sync::Arc;
 
 use crate::{AggregateExpr, PhysicalExpr};
 use arrow::compute;
-use arrow::datatypes::{DataType, TimeUnit};
+use arrow::datatypes::{DataType, IntervalUnit, TimeUnit};
 use arrow::{
     array::{
         ArrayRef, BooleanArray, Date32Array, Date64Array, Float32Array, Float64Array,
-        Int16Array, Int32Array, Int64Array, Int8Array, LargeStringArray, StringArray,
-        Time32MillisecondArray, Time32SecondArray, Time64MicrosecondArray,
-        Time64NanosecondArray, TimestampMicrosecondArray, TimestampMillisecondArray,
-        TimestampNanosecondArray, TimestampSecondArray, UInt16Array, UInt32Array,
-        UInt64Array, UInt8Array,
+        Int16Array, Int32Array, Int64Array, Int8Array, IntervalDayTimeArray,
+        LargeStringArray, StringArray, Time32MillisecondArray, Time32SecondArray,
+        Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray,
+        TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray,
+        UInt16Array, UInt32Array, UInt64Array, UInt8Array,
     },
     datatypes::Field,
 };
@@ -265,6 +265,9 @@ macro_rules! min_max_batch {
                     Time64Nanosecond,
                     $OP
                 )
+            }
+            DataType::Interval(IntervalUnit::DayTime) => {
+                typed_min_max_batch!($VALUES, IntervalDayTimeArray, IntervalDayTime, $OP)
             }
             other => {
                 // This should have been handled before
