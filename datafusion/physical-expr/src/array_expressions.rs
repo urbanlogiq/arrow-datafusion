@@ -26,7 +26,6 @@ use datafusion_common::cast::as_list_array;
 use datafusion_common::ScalarValue;
 use datafusion_common::{DataFusionError, Result};
 use datafusion_expr::ColumnarValue;
-use itertools::Itertools;
 use std::sync::Arc;
 
 macro_rules! downcast_vec {
@@ -1073,12 +1072,38 @@ pub fn array_ndims(args: &[ColumnarValue]) -> Result<ColumnarValue> {
 
 macro_rules! contains {
     ($FIRST_ARRAY:expr, $SECOND_ARRAY:expr, $ARRAY_TYPE:ident) => {{
-        let first_array = downcast_arg!($FIRST_ARRAY, $ARRAY_TYPE);
+        let first_array = downcast_arg!($FIRST_ARRAY, ListArray);
         let second_array = downcast_arg!($SECOND_ARRAY, $ARRAY_TYPE);
-        let mut res = true;
-        for x in second_array.values().iter().dedup() {
-            if !first_array.values().contains(x) {
-                res = false;
+
+        let mut res = Vec::with_capacity(first_array.len());
+
+        for i in 0..first_array.len() {
+            if !first_array.is_null(i) || first_array.len() != 0 {
+                let f = first_array.value(i);
+                let a0 = downcast_arg!(f, $ARRAY_TYPE);
+
+                let mut contains = true;
+                for v1 in second_array {
+                    let Some(v1) = v1 else { continue; };
+                    let mut have = false;
+
+                    for v0 in a0 {
+                        let Some(v0) = v0 else { continue; };
+                        if v0 == v1 {
+                            have = true;
+                            break;
+                        }
+                    }
+
+                    contains = contains && have;
+                    if !contains {
+                        break;
+                    }
+                }
+
+                res.push(contains);
+            } else {
+                res.push(false);
             }
         }
 
@@ -1104,35 +1129,46 @@ pub fn array_contains(args: &[ArrayRef]) -> Result<ArrayRef> {
         }
     }
 
-    let concat_first_array = concat_inner_lists(args[0].clone())?.clone();
+    let concat_first_array = args[0].clone(); // concat_inner_lists(args[0].clone())?.clone();
     let concat_second_array = concat_inner_lists(args[1].clone())?.clone();
 
-    let res = match (concat_first_array.data_type(), concat_second_array.data_type()) {
-        (DataType::Utf8, DataType::Utf8) => contains!(concat_first_array, concat_second_array, StringArray),
-        (DataType::LargeUtf8, DataType::LargeUtf8) => contains!(concat_first_array, concat_second_array, LargeStringArray),
-        (DataType::Boolean, DataType::Boolean) => {
-            let first_array = downcast_arg!(concat_first_array, BooleanArray);
-            let second_array = downcast_arg!(concat_second_array, BooleanArray);
-            compute::bool_or(first_array) == compute::bool_or(second_array)
+    let res = match concat_first_array.data_type() {
+        DataType::List(f0) => {
+            match (f0.data_type(), concat_second_array.data_type()) {
+                (DataType::Utf8, DataType::Utf8) => contains!(concat_first_array, concat_second_array, StringArray),
+                (DataType::LargeUtf8, DataType::LargeUtf8) => contains!(concat_first_array, concat_second_array, LargeStringArray),
+                /*
+                (DataType::Boolean, DataType::Boolean) => {
+                    let first_array = downcast_arg!(concat_first_array, BooleanArray);
+                    let second_array = downcast_arg!(concat_second_array, BooleanArray);
+                    compute::bool_or(first_array) == compute::bool_or(second_array)
+                }
+                */
+                (DataType::Float32, DataType::Float32) => contains!(concat_first_array, concat_second_array, Float32Array),
+                (DataType::Float64, DataType::Float64) => contains!(concat_first_array, concat_second_array, Float64Array),
+                (DataType::Int8, DataType::Int8) => contains!(concat_first_array, concat_second_array, Int8Array),
+                (DataType::Int16, DataType::Int16) => contains!(concat_first_array, concat_second_array, Int16Array),
+                (DataType::Int32, DataType::Int32) => contains!(concat_first_array, concat_second_array, Int32Array),
+                (DataType::Int64, DataType::Int64) => contains!(concat_first_array, concat_second_array, Int64Array),
+                (DataType::UInt8, DataType::UInt8) => contains!(concat_first_array, concat_second_array, UInt8Array),
+                (DataType::UInt16, DataType::UInt16) => contains!(concat_first_array, concat_second_array, UInt16Array),
+                (DataType::UInt32, DataType::UInt32) => contains!(concat_first_array, concat_second_array, UInt32Array),
+                (DataType::UInt64, DataType::UInt64) => contains!(concat_first_array, concat_second_array, UInt64Array),
+                (first_data_type, second_data_type) => {
+                    return Err(DataFusionError::NotImplemented(format!(
+                        "Array_contains is not implemented for list element types '{first_data_type:?}' and '{second_data_type:?}'."
+                    )))
+                }
+            }
         }
-        (DataType::Float32, DataType::Float32) => contains!(concat_first_array, concat_second_array, Float32Array),
-        (DataType::Float64, DataType::Float64) => contains!(concat_first_array, concat_second_array, Float64Array),
-        (DataType::Int8, DataType::Int8) => contains!(concat_first_array, concat_second_array, Int8Array),
-        (DataType::Int16, DataType::Int16) => contains!(concat_first_array, concat_second_array, Int16Array),
-        (DataType::Int32, DataType::Int32) => contains!(concat_first_array, concat_second_array, Int32Array),
-        (DataType::Int64, DataType::Int64) => contains!(concat_first_array, concat_second_array, Int64Array),
-        (DataType::UInt8, DataType::UInt8) => contains!(concat_first_array, concat_second_array, UInt8Array),
-        (DataType::UInt16, DataType::UInt16) => contains!(concat_first_array, concat_second_array, UInt16Array),
-        (DataType::UInt32, DataType::UInt32) => contains!(concat_first_array, concat_second_array, UInt32Array),
-        (DataType::UInt64, DataType::UInt64) => contains!(concat_first_array, concat_second_array, UInt64Array),
-        (first_array_data_type, second_array_data_type) => {
+        first_array_data_type => {
             return Err(DataFusionError::NotImplemented(format!(
-                "Array_contains is not implemented for types '{first_array_data_type:?}' and '{second_array_data_type:?}'."
+                "Array_contains is not implemented for types '{first_array_data_type:?}'."
             )))
         }
     };
 
-    Ok(Arc::new(BooleanArray::from(vec![res])))
+    Ok(Arc::new(BooleanArray::from(res)))
 }
 
 #[cfg(test)]
