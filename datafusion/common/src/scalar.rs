@@ -2659,6 +2659,28 @@ impl ScalarValue {
         // Concatenate element arrays to create single flat array
         let element_arrays: Vec<&dyn Array> =
             elements.iter().map(|a| a.as_ref()).collect();
+
+        // URBANLOGIQ PATCH: This function normally fails when the element arrays
+        // are empty, so if that is the case, generate a proper empty array.
+        if element_arrays.is_empty() {
+            use arrow::buffer::Buffer;
+
+            let value_data = match data_type {
+                DataType::List(field) => new_empty_array(field.data_type()).to_data(),
+                _ => unreachable!(),
+            };
+            let value_offsets = Buffer::from([]);
+
+            let array_data = ArrayDataBuilder::new(data_type.clone())
+                .len(0)
+                .nulls(Some(NullBuffer::new_null(0)))
+                .add_buffer(value_offsets)
+                .add_child_data(value_data)
+                .build()?;
+
+            return Ok(ListArray::from(array_data));
+        }
+
         let flat_array = match arrow::compute::concat(&element_arrays) {
             Ok(flat_array) => flat_array,
             Err(err) => return Err(DataFusionError::ArrowError(err)),
