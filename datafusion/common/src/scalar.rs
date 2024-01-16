@@ -1881,6 +1881,18 @@ impl ScalarValue {
                 let arrays = std::iter::repeat(arr.as_ref())
                     .take(size)
                     .collect::<Vec<_>>();
+                // URBANLOGIQ PATCH: This function normally fails when the element arrays
+                // are empty, so if that is the case, generate a proper empty array.
+                if arrays.is_empty() {
+                    let field =
+                        Arc::new(Field::new("list", arr.data_type().clone(), true));
+                    let list_data_type = match self {
+                        ScalarValue::List(_) => DataType::List(field),
+                        ScalarValue::LargeList(_) => DataType::LargeList(field),
+                        _ => unreachable!(),
+                    };
+                    return Ok(new_empty_array(&list_data_type));
+                }
                 arrow::compute::concat(arrays.as_slice())
                     .map_err(DataFusionError::ArrowError)?
             }
