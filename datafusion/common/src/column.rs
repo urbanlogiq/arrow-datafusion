@@ -309,10 +309,14 @@ impl Column {
                         }
                     }
 
-                    // If not due to USING columns then due to ambiguous column name
-                    return _schema_err!(SchemaError::AmbiguousReference {
-                        field: Column::new_unqualified(self.name),
-                    });
+                    // HACK: disable the ambiguity check, just return the first matching column
+                    // Dashboard queries can generate "ambiguous column" errors and we haven't been able to work around that yet
+                    // Context: https://urbanlogiq.atlassian.net/browse/UB-3208
+                    return Ok(columns[0].clone());
+                    // // If not due to USING columns then due to ambiguous column name
+                    // return _schema_err!(SchemaError::AmbiguousReference {
+                    //     field: Column::new_unqualified(self.name),
+                    // });
                 }
             }
         }
