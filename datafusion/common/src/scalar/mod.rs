@@ -2011,16 +2011,16 @@ impl ScalarValue {
                 ),
             },
             ScalarValue::List(arr) => {
-                Self::list_to_array_of_size(arr.as_ref() as &dyn Array, size)?
+                self.list_to_array_of_size(arr.as_ref() as &dyn Array, size)?
             }
             ScalarValue::LargeList(arr) => {
-                Self::list_to_array_of_size(arr.as_ref() as &dyn Array, size)?
+                self.list_to_array_of_size(arr.as_ref() as &dyn Array, size)?
             }
             ScalarValue::FixedSizeList(arr) => {
-                Self::list_to_array_of_size(arr.as_ref() as &dyn Array, size)?
+                self.list_to_array_of_size(arr.as_ref() as &dyn Array, size)?
             }
             ScalarValue::Struct(arr) => {
-                Self::list_to_array_of_size(arr.as_ref() as &dyn Array, size)?
+                self.list_to_array_of_size(arr.as_ref() as &dyn Array, size)?
             }
             ScalarValue::Date32(e) => {
                 build_array_from_option!(Date32, Date32Array, e, size)
@@ -2193,8 +2193,19 @@ impl ScalarValue {
         }
     }
 
-    fn list_to_array_of_size(arr: &dyn Array, size: usize) -> Result<ArrayRef> {
+    fn list_to_array_of_size(&self, arr: &dyn Array, size: usize) -> Result<ArrayRef> {
         let arrays = std::iter::repeat(arr).take(size).collect::<Vec<_>>();
+        // This function normally fails when the element arrays are empty, so if
+        // that is the case, generate a proper empty array.
+        if arrays.is_empty() {
+            let field = Arc::new(Field::new("list", arr.data_type().clone(), true));
+            let list_data_type = match self {
+                ScalarValue::List(_) => DataType::List(field),
+                ScalarValue::LargeList(_) => DataType::LargeList(field),
+                _ => unreachable!(),
+            };
+            return Ok(new_empty_array(&list_data_type));
+        }
         Ok(arrow::compute::concat(arrays.as_slice())?)
     }
 
