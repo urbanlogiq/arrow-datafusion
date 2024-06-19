@@ -260,26 +260,14 @@ impl Column {
                         }
                     }
 
-                    // If not due to USING columns then due to ambiguous column name
-                    return _schema_err!(SchemaError::AmbiguousReference {
-                        field: Column::new_unqualified(&self.name),
-                    })
-                    .map_err(|err| {
-                        let mut diagnostic = Diagnostic::new_error(
-                            format!("column '{}' is ambiguous", &self.name),
-                            self.spans().first(),
-                        );
-                        // TODO If [`DFSchema`] had spans, we could show the
-                        // user which columns are candidates, or which table
-                        // they come from. For now, let's list the table names
-                        // only.
-                        add_possible_columns_to_diag(
-                            &mut diagnostic,
-                            &Column::new_unqualified(&self.name),
-                            &columns,
-                        );
-                        err.with_diagnostic(diagnostic)
-                    });
+                    // HACK: disable the ambiguity check, just return the first matching column
+                    // Dashboard queries can generate "ambiguous column" errors and we haven't been able to work around that yet
+                    // Context: https://urbanlogiq.atlassian.net/browse/UB-3208
+                    return Ok(columns[0].clone());
+                    // // If not due to USING columns then due to ambiguous column name
+                    // return _schema_err!(SchemaError::AmbiguousReference {
+                    //     field: Column::new_unqualified(self.name),
+                    // });
                 }
             }
         }
