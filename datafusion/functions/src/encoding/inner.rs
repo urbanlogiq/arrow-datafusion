@@ -26,7 +26,9 @@ use arrow::{
 use arrow_buffer::{Buffer, OffsetBufferBuilder};
 use base64::{engine::general_purpose, Engine as _};
 use datafusion_common::{
-    cast::{as_generic_binary_array, as_generic_string_array},
+    cast::{
+        as_fixed_size_binary_array, as_generic_binary_array, as_generic_string_array,
+    },
     not_impl_err, plan_err,
 };
 use datafusion_common::{exec_err, ScalarValue};
@@ -87,7 +89,22 @@ impl ScalarUDFImpl for EncodeFunc {
     }
 
     fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
-        Ok(arg_types[0].to_owned())
+        use DataType::*;
+
+        Ok(match arg_types[0] {
+            Utf8 => Utf8,
+            LargeUtf8 => LargeUtf8,
+            Utf8View => Utf8,
+            Binary => Utf8,
+            FixedSizeBinary(_) => Utf8,
+            LargeBinary => LargeUtf8,
+            Null => Null,
+            _ => {
+                return plan_err!(
+                    "The encode function can only accept Utf8 or Binary or Null."
+                );
+            }
+        })
     }
 
     fn invoke(&self, args: &[ColumnarValue]) -> Result<ColumnarValue> {
@@ -108,11 +125,14 @@ impl ScalarUDFImpl for EncodeFunc {
         }
 
         match arg_types[0] {
-            DataType::Utf8 | DataType::Binary | DataType::Null => {
+            DataType::Utf8 | DataType::Utf8View | DataType::Null => {
                 Ok(vec![DataType::Utf8; 2])
             }
-            DataType::LargeUtf8 | DataType::LargeBinary => {
-                Ok(vec![DataType::LargeUtf8, DataType::Utf8])
+            DataType::LargeUtf8 => Ok(vec![DataType::LargeUtf8, DataType::Utf8]),
+            DataType::Binary => Ok(vec![DataType::Binary, DataType::Utf8]),
+            DataType::LargeBinary => Ok(vec![DataType::LargeBinary, DataType::Utf8]),
+            DataType::FixedSizeBinary(sz) => {
+                Ok(vec![DataType::FixedSizeBinary(sz), DataType::Utf8])
             }
             _ => plan_err!(
                 "1st argument should be Utf8 or Binary or Null, got {:?}",
@@ -226,6 +246,9 @@ fn encode_process(value: &ColumnarValue, encoding: Encoding) -> Result<ColumnarV
             DataType::LargeUtf8 => encoding.encode_utf8_array::<i64>(a.as_ref()),
             DataType::Binary => encoding.encode_binary_array::<i32>(a.as_ref()),
             DataType::LargeBinary => encoding.encode_binary_array::<i64>(a.as_ref()),
+            DataType::FixedSizeBinary(_) => {
+                encoding.encode_fixed_size_binary_array(a.as_ref())
+            }
             other => exec_err!(
                 "Unsupported data type {other:?} for function encode({encoding})"
             ),
@@ -242,6 +265,9 @@ fn encode_process(value: &ColumnarValue, encoding: Encoding) -> Result<ColumnarV
                 ),
                 ScalarValue::LargeBinary(a) => Ok(encoding
                     .encode_large_scalar(a.as_ref().map(|v: &Vec<u8>| v.as_slice()))),
+                ScalarValue::FixedSizeBinary(_, a) => Ok(
+                    encoding.encode_scalar(a.as_ref().map(|v: &Vec<u8>| v.as_slice()))
+                ),
                 other => exec_err!(
                     "Unsupported data type {other:?} for function encode({encoding})"
                 ),
@@ -372,6 +398,15 @@ impl Encoding {
         T: OffsetSizeTrait,
     {
         let input_value = as_generic_binary_array::<T>(value)?;
+        let array: ArrayRef = match self {
+            Self::Base64 => encode_to_array!(base64_encode, input_value),
+            Self::Hex => encode_to_array!(hex_encode, input_value),
+        };
+        Ok(ColumnarValue::Array(array))
+    }
+
+    fn encode_fixed_size_binary_array(self, value: &dyn Array) -> Result<ColumnarValue> {
+        let input_value = as_fixed_size_binary_array(value)?;
         let array: ArrayRef = match self {
             Self::Base64 => encode_to_array!(base64_encode, input_value),
             Self::Hex => encode_to_array!(hex_encode, input_value),
@@ -562,4 +597,30 @@ fn decode(args: &[ColumnarValue]) -> Result<ColumnarValue> {
         ),
     }?;
     decode_process(&args[0], encoding)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn test_encode_fsb() {
+        use super::*;
+
+        let value = vec![0u8; 16];
+        let array = arrow::array::FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+            vec![Some(value)].into_iter(),
+            16,
+        )
+        .unwrap();
+        let value = ColumnarValue::Array(Arc::new(array));
+
+        let ColumnarValue::Array(result) =
+            encode_process(&value, Encoding::Base64).unwrap()
+        else {
+            panic!("unexpected value");
+        };
+
+        let string_array = result.as_any().downcast_ref::<StringArray>().unwrap();
+        let result_value = string_array.value(0);
+        assert_eq!(result_value, "AAAAAAAAAAAAAAAAAAAAAA");
+    }
 }

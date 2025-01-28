@@ -237,7 +237,7 @@ pub fn as_fixed_size_list_array(array: &dyn Array) -> Result<&FixedSizeListArray
     Ok(downcast_value!(array, FixedSizeListArray))
 }
 
-// Downcast ArrayRef to FixedSizeListArray
+// Downcast ArrayRef to FixedSizeBinaryArray
 pub fn as_fixed_size_binary_array(array: &dyn Array) -> Result<&FixedSizeBinaryArray> {
     Ok(downcast_value!(array, FixedSizeBinaryArray))
 }
