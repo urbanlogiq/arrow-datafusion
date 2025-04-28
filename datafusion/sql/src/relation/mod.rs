@@ -150,11 +150,10 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
             }
         };
 
-        let optimized_plan = optimize_subquery_sort(plan)?.data;
         if let Some(alias) = alias {
-            self.apply_table_alias(optimized_plan, alias)
+            self.apply_table_alias(plan, alias)
         } else {
-            Ok(optimized_plan)
+            Ok(plan)
         }
     }
 
