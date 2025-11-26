@@ -1674,6 +1674,8 @@ fn temporal_coercion_nonstrict_timezone(
 
             Some(Timestamp(unit, tz))
         }
+        (Timestamp(_, _), Int64) => Some(lhs_type.clone()),
+        (Int64, Timestamp(_, _)) => Some(rhs_type.clone()),
         _ => temporal_coercion(lhs_type, rhs_type),
     }
 }
@@ -1721,6 +1723,8 @@ fn temporal_coercion_strict_timezone(
 
             Some(Timestamp(unit, tz))
         }
+        (Timestamp(_, _), Int64) => Some(lhs_type.clone()),
+        (Int64, Timestamp(_, _)) => Some(rhs_type.clone()),
         _ => temporal_coercion(lhs_type, rhs_type),
     }
 }
