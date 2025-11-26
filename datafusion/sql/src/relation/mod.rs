@@ -191,12 +191,18 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             }
         };
 
-        let optimized_plan = optimize_subquery_sort(plan)?.data;
         if let Some(alias) = alias {
-            self.apply_table_alias(optimized_plan, alias)
+            self.apply_table_alias(plan, alias)
         } else {
-            Ok(optimized_plan)
+            Ok(plan)
         }
+        // see: https://github.com/apache/datafusion/issues/15886
+        // let optimized_plan = optimize_subquery_sort(plan)?.data;
+        // if let Some(alias) = alias {
+        //     self.apply_table_alias(optimized_plan, alias)
+        // } else {
+        //     Ok(optimized_plan)
+        // }
     }
 
     pub(crate) fn create_relation_subquery(
