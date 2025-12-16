@@ -70,7 +70,7 @@ impl ConcatFunc {
         use DataType::*;
         Self {
             signature: Signature::variadic(
-                vec![Utf8View, Utf8, LargeUtf8, Binary],
+                vec![Utf8, Utf8View, LargeUtf8, Binary],
                 Volatility::Immutable,
             ),
         }
