@@ -87,6 +87,35 @@ const LOWEST: &BinaryOperator = &BinaryOperator::Or;
 // (https://www.postgresql.org/docs/7.2/sql-precedence.html)
 const IS: &BinaryOperator = &BinaryOperator::BitwiseAnd;
 
+fn new_ident_without_quote_style(str: String) -> Ident {
+    Ident {
+        value: str,
+        quote_style: None,
+        span: Span::empty(),
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct DefaultVariableMapper {}
+
+impl super::VariableMapper for DefaultVariableMapper {
+    fn map_variable(&self, ids: &[String]) -> Result<ast::Expr> {
+        if ids.is_empty() {
+            return internal_err!("Not a valid ScalarVariable");
+        }
+
+        Ok(if ids.len() == 1 {
+            ast::Expr::Identifier(new_ident_without_quote_style(ids[0].to_string()))
+        } else {
+            ast::Expr::CompoundIdentifier(
+                ids.iter()
+                    .map(|i| new_ident_without_quote_style(i.to_string()))
+                    .collect(),
+            )
+        })
+    }
+}
+
 impl Unparser<'_> {
     pub fn expr_to_sql(&self, expr: &Expr) -> Result<ast::Expr> {
         let mut root_expr = self.expr_to_sql_inner(expr)?;
@@ -446,23 +475,7 @@ impl Unparser<'_> {
                     expr: Box::new(sql_parser_expr),
                 })
             }
-            Expr::ScalarVariable(_, ids) => {
-                if ids.is_empty() {
-                    return internal_err!("Not a valid ScalarVariable");
-                }
-
-                Ok(if ids.len() == 1 {
-                    ast::Expr::Identifier(
-                        self.new_ident_without_quote_style(ids[0].to_string()),
-                    )
-                } else {
-                    ast::Expr::CompoundIdentifier(
-                        ids.iter()
-                            .map(|i| self.new_ident_without_quote_style(i.to_string()))
-                            .collect(),
-                    )
-                })
-            }
+            Expr::ScalarVariable(_, ids) => self.variable_mapper.map_variable(ids),
             Expr::TryCast(TryCast { expr, data_type }) => {
                 let inner_expr = self.expr_to_sql_inner(expr)?;
                 Ok(ast::Expr::Cast {
@@ -831,14 +844,6 @@ impl Unparser<'_> {
         Ident {
             value: ident,
             quote_style,
-            span: Span::empty(),
-        }
-    }
-
-    pub(super) fn new_ident_without_quote_style(&self, str: String) -> Ident {
-        Ident {
-            value: str,
-            quote_style: None,
             span: Span::empty(),
         }
     }

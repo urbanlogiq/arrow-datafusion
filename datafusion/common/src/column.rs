@@ -17,10 +17,10 @@
 
 //! Column
 
-use crate::error::{_schema_err, add_possible_columns_to_diag};
+use crate::error::_schema_err;
 use crate::utils::parse_identifiers_normalized;
 use crate::utils::quote_identifier;
-use crate::{DFSchema, Diagnostic, Result, SchemaError, Spans, TableReference};
+use crate::{DFSchema, Result, SchemaError, Spans, TableReference};
 use arrow::datatypes::{Field, FieldRef};
 use std::collections::HashSet;
 use std::fmt;

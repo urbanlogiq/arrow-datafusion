@@ -261,6 +261,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
     }
 }
 
+#[allow(dead_code)]
 fn optimize_subquery_sort(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
     // When initializing subqueries, we examine sort options since they might be unnecessary.
     // They are only important if the subquery result is affected by the ORDER BY statement,

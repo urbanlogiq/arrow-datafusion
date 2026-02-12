@@ -23,6 +23,8 @@ mod plan;
 mod rewrite;
 mod utils;
 
+use datafusion_common::Result;
+
 use self::dialect::{DefaultDialect, Dialect};
 use crate::unparser::extension_unparser::UserDefinedLogicalNodeUnparser;
 pub use expr::expr_to_sql;
@@ -30,6 +32,10 @@ pub use plan::plan_to_sql;
 use std::sync::Arc;
 pub mod dialect;
 pub mod extension_unparser;
+
+pub trait VariableMapper: Sync + Send + std::fmt::Debug {
+    fn map_variable(&self, ids: &[String]) -> Result<sqlparser::ast::Expr>;
+}
 
 /// Convert a DataFusion [`Expr`] to [`sqlparser::ast::Expr`]
 ///
@@ -58,6 +64,7 @@ pub struct Unparser<'a> {
     dialect: &'a dyn Dialect,
     pretty: bool,
     extension_unparsers: Vec<Arc<dyn UserDefinedLogicalNodeUnparser>>,
+    variable_mapper: Arc<dyn VariableMapper>,
 }
 
 impl<'a> Unparser<'a> {
@@ -66,6 +73,7 @@ impl<'a> Unparser<'a> {
             dialect,
             pretty: false,
             extension_unparsers: vec![],
+            variable_mapper: Arc::new(expr::DefaultVariableMapper {}),
         }
     }
 
@@ -110,6 +118,14 @@ impl<'a> Unparser<'a> {
         self
     }
 
+    pub fn with_variable_mapper(
+        mut self,
+        variable_mapper: Arc<dyn VariableMapper>,
+    ) -> Self {
+        self.variable_mapper = variable_mapper;
+        self
+    }
+
     /// Add a custom unparser for user defined logical nodes
     ///
     /// DataFusion allows user to define custom logical nodes. This method allows to add custom child unparsers for these nodes.
@@ -136,6 +152,7 @@ impl Default for Unparser<'_> {
             dialect: &DefaultDialect {},
             pretty: false,
             extension_unparsers: vec![],
+            variable_mapper: Arc::new(expr::DefaultVariableMapper {}),
         }
     }
 }
