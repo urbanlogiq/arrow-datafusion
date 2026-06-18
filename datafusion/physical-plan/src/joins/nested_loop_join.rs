@@ -25,8 +25,8 @@ use std::sync::Arc;
 use std::task::Poll;
 
 use super::utils::{
-    asymmetric_join_output_partitioning, need_produce_result_in_final,
-    reorder_output_after_swap, swap_join_projection,
+    asymmetric_join_output_partitioning, build_batch_offsets, flat_index_to_batch_row,
+    need_produce_result_in_final, reorder_output_after_swap, swap_join_projection,
 };
 use crate::common::can_project;
 use crate::execution_plan::{boundedness_from_children, EmissionType};
@@ -53,9 +53,7 @@ use arrow::array::{
     UInt64Array,
 };
 use arrow::buffer::BooleanBuffer;
-use arrow::compute::{
-    concat_batches, filter, filter_record_batch, not, take, BatchCoalescer,
-};
+use arrow::compute::{filter, filter_record_batch, not, take, BatchCoalescer};
 use arrow::datatypes::{Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use arrow_schema::DataType;
@@ -610,9 +608,19 @@ impl EmbeddedProjection for NestedLoopJoinExec {
 
 /// Left (build-side) data
 pub(crate) struct JoinLeftData {
-    /// Build-side data collected to single batch
-    batch: RecordBatch,
-    /// Shared bitmap builder for visited left indices
+    /// Build-side data kept as the original (un-concatenated) batches.
+    ///
+    /// Rows are addressed by a flat index into the logical concatenation of these
+    /// batches; [`JoinLeftData::locate`] resolves a flat index to a `(batch, row)`
+    /// pair. Keeping the batches separate avoids copying the whole build side into
+    /// one contiguous batch.
+    batches: Vec<RecordBatch>,
+    /// Build-side schema. Retained so it is available even when `batches` is empty.
+    schema: SchemaRef,
+    /// Prefix-sum offsets: `offsets[k]` is the first flat row index of `batches[k]`,
+    /// and `offsets[batches.len()]` is the total row count.
+    offsets: Vec<usize>,
+    /// Shared bitmap builder for visited left indices (flat-indexed)
     bitmap: SharedBitmapBuilder,
     /// Counter of running probe-threads, potentially able to update `bitmap`
     probe_threads_counter: AtomicUsize,
@@ -625,21 +633,46 @@ pub(crate) struct JoinLeftData {
 
 impl JoinLeftData {
     pub(crate) fn new(
-        batch: RecordBatch,
+        batches: Vec<RecordBatch>,
+        schema: SchemaRef,
+        offsets: Vec<usize>,
         bitmap: SharedBitmapBuilder,
         probe_threads_counter: AtomicUsize,
         reservation: MemoryReservation,
     ) -> Self {
         Self {
-            batch,
+            batches,
+            schema,
+            offsets,
             bitmap,
             probe_threads_counter,
             reservation,
         }
     }
 
-    pub(crate) fn batch(&self) -> &RecordBatch {
-        &self.batch
+    /// Total number of build-side rows across all batches
+    pub(crate) fn num_rows(&self) -> usize {
+        *self.offsets.last().unwrap()
+    }
+
+    /// Build-side schema
+    pub(crate) fn schema(&self) -> &SchemaRef {
+        &self.schema
+    }
+
+    /// The build-side batch at index `batch_idx`
+    pub(crate) fn batch_at(&self, batch_idx: usize) -> &RecordBatch {
+        &self.batches[batch_idx]
+    }
+
+    /// Flat-index offsets (see field docs)
+    pub(crate) fn offsets(&self) -> &[usize] {
+        &self.offsets
+    }
+
+    /// Resolve a flat build-side row index to a `(batch, row)` pair
+    pub(crate) fn locate(&self, flat: usize) -> (usize, usize) {
+        flat_index_to_batch_row(&self.offsets, flat)
     }
 
     pub(crate) fn bitmap(&self) -> &SharedBitmapBuilder {
@@ -682,11 +715,14 @@ async fn collect_left_input(
         )
         .await?;
 
-    let merged_batch = concat_batches(&schema, &batches)?;
+    // Keep the build-side batches un-concatenated; rows are addressed by a flat
+    // index into their logical concatenation via these prefix-sum offsets.
+    let offsets = build_batch_offsets(batches.iter().map(RecordBatch::num_rows));
+    let num_rows = *offsets.last().unwrap();
 
     // Reserve memory for visited_left_side bitmap if required by join type
     let visited_left_side = if with_visited_left_side {
-        let n_rows = merged_batch.num_rows();
+        let n_rows = num_rows;
         let buffer_size = n_rows.div_ceil(8);
         reservation.try_grow(buffer_size)?;
         metrics.build_mem_used.add(buffer_size);
@@ -699,7 +735,9 @@ async fn collect_left_input(
     };
 
     Ok(JoinLeftData::new(
-        merged_batch,
+        batches,
+        schema,
+        offsets,
         Mutex::new(visited_left_side),
         AtomicUsize::new(probe_threads_count),
         reservation,
@@ -1134,7 +1172,7 @@ impl NestedLoopJoinStream {
                 if let (Ok(left_data), Some(right_batch)) =
                     (self.get_left_data(), self.current_right_batch.as_ref())
                 {
-                    let left_rows = left_data.batch().num_rows();
+                    let left_rows = left_data.num_rows();
                     let right_rows = right_batch.num_rows();
                     self.metrics.selectivity.add_total(left_rows * right_rows);
                 }
@@ -1260,7 +1298,7 @@ impl NestedLoopJoinStream {
             .clone();
 
         // stop probing, the caller will go to the next state
-        if self.left_probe_idx >= left_data.batch().num_rows() {
+        if self.left_probe_idx >= left_data.num_rows() {
             return Ok(false);
         }
 
@@ -1299,13 +1337,13 @@ impl NestedLoopJoinStream {
             return Ok(None);
         }
 
+        // Resolve the flat left-row index to the batch it lives in and the row
+        // offset within that batch (the build side is not concatenated).
+        let (left_batch_idx, left_row_idx) = left_data.locate(l_index);
+        let left_batch = left_data.batch_at(left_batch_idx);
+
         let cur_right_bitmap = if let Some(filter) = &self.join_filter {
-            apply_filter_to_row_join_batch(
-                left_data.batch(),
-                l_index,
-                right_batch,
-                filter,
-            )?
+            apply_filter_to_row_join_batch(left_batch, left_row_idx, right_batch, filter)?
         } else {
             BooleanArray::from(vec![true; right_row_count])
         };
@@ -1333,8 +1371,8 @@ impl NestedLoopJoinStream {
             // Use the optimized approach similar to build_intermediate_batch_for_single_left_row
             let join_batch = build_row_join_batch(
                 &self.output_schema,
-                left_data.batch(),
-                l_index,
+                left_batch,
+                left_row_idx,
                 right_batch,
                 Some(cur_right_bitmap),
                 &self.column_indices,
@@ -1349,7 +1387,7 @@ impl NestedLoopJoinStream {
     /// false -> next state (Done)
     fn process_left_unmatched(&mut self) -> Result<bool> {
         let left_data = self.get_left_data()?;
-        let left_batch = left_data.batch();
+        let num_rows = left_data.num_rows();
 
         // ========
         // Check early return conditions
@@ -1361,7 +1399,7 @@ impl NestedLoopJoinStream {
         let handled_by_other_partition =
             self.left_emit_idx == 0 && !left_data.report_probe_completed();
         // Stop processing unmatched rows, the caller will go to the next state
-        let finished = self.left_emit_idx >= left_batch.num_rows();
+        let finished = self.left_emit_idx >= num_rows;
 
         if join_type_no_produce_left || handled_by_other_partition || finished {
             return Ok(false);
@@ -1369,10 +1407,14 @@ impl NestedLoopJoinStream {
 
         // ========
         // Process unmatched rows and push the result into output_buffer
-        // Each time, the number to process is up to batch size
+        // Each time, the number to process is up to batch size. Because the build
+        // side is stored as separate batches, also clamp the range to the batch
+        // containing `start_idx` so the slice stays within a single batch.
         // ========
         let start_idx = self.left_emit_idx;
-        let end_idx = std::cmp::min(start_idx + self.batch_size, left_batch.num_rows());
+        let (start_batch_idx, _) = left_data.locate(start_idx);
+        let batch_end = left_data.offsets()[start_batch_idx + 1];
+        let end_idx = std::cmp::min(start_idx + self.batch_size, batch_end);
 
         if let Some(batch) =
             self.process_left_unmatched_range(left_data, start_idx, end_idx)?
@@ -1410,9 +1452,13 @@ impl NestedLoopJoinStream {
         }
 
         // Slice both left batch, and bitmap to range [start_idx, end_idx)
-        // The range is bit index (not byte)
-        let left_batch = left_data.batch();
-        let left_batch_sliced = left_batch.slice(start_idx, end_idx - start_idx);
+        // The range is bit index (not byte). The caller guarantees the range lies
+        // within a single build batch, so resolve `start_idx` to that batch and
+        // slice it directly (no concatenation of the build side).
+        let (batch_idx, local_start) = left_data.locate(start_idx);
+        let left_batch_sliced = left_data
+            .batch_at(batch_idx)
+            .slice(local_start, end_idx - start_idx);
 
         // Can this be more efficient?
         let mut bitmap_sliced = BooleanBufferBuilder::new(end_idx - start_idx);
@@ -1451,7 +1497,7 @@ impl NestedLoopJoinStream {
         let cur_right_batch = unwrap_or_internal_err!(right_batch);
 
         let left_data = self.get_left_data()?;
-        let left_schema = left_data.batch().schema();
+        let left_schema = Arc::clone(left_data.schema());
 
         let res = build_unmatched_batch(
             Arc::clone(&self.output_schema),
@@ -2234,6 +2280,53 @@ pub(crate) mod tests {
     async fn join_full_with_filter(#[values(1, 2, 16)] batch_size: usize) -> Result<()> {
         let task_ctx = new_task_ctx(batch_size);
         let left = build_left_table();
+        let right = build_right_table();
+
+        let filter = prepare_join_filter();
+        let (columns, batches, metrics) = multi_partitioned_join_collect(
+            left,
+            right,
+            &JoinType::Full,
+            Some(filter),
+            task_ctx,
+        )
+        .await?;
+        assert_eq!(columns, vec!["a1", "b1", "c1", "a2", "b2", "c2"]);
+        allow_duplicates!(assert_snapshot!(batches_to_sort_string(&batches), @r#"
+            +----+----+-----+----+----+-----+
+            | a1 | b1 | c1  | a2 | b2 | c2  |
+            +----+----+-----+----+----+-----+
+            |    |    |     | 10 | 10 | 100 |
+            |    |    |     | 12 | 10 | 40  |
+            | 11 | 8  | 110 |    |    |     |
+            | 5  | 5  | 50  | 2  | 2  | 80  |
+            | 9  | 8  | 90  |    |    |     |
+            +----+----+-----+----+----+-----+
+            "#));
+
+        assert_join_metrics!(metrics, 5);
+
+        Ok(())
+    }
+
+    // Full join where the BUILD (left) side is split across multiple record
+    // batches, so the build side is collected without concatenation. Exercises
+    // resolving flat left-row indices to `(batch, row)` for matched rows and
+    // slicing unmatched-left ranges within a single batch across batch boundaries.
+    #[rstest]
+    #[tokio::test]
+    async fn join_full_with_filter_multi_batch_left(
+        #[values(1, 2, 16)] batch_size: usize,
+    ) -> Result<()> {
+        let task_ctx = new_task_ctx(batch_size);
+        // Split the build (left) side into single-row batches.
+        let left = build_table(
+            ("a1", &vec![5, 9, 11]),
+            ("b1", &vec![5, 8, 8]),
+            ("c1", &vec![50, 90, 110]),
+            Some(1),
+            Vec::new(),
+        );
         let right = build_right_table();
 
         let filter = prepare_join_filter();

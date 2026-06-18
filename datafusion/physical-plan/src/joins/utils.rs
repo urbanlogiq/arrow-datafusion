@@ -1001,7 +1001,9 @@ pub(crate) fn build_batch_from_indices(
 /// concatenation of all batches, and `offsets[n]` is the total row count. This
 /// lets a flat build-side index be mapped back to a `(batch, row)` pair without
 /// materializing the concatenation.
-fn build_batch_offsets(batch_row_counts: impl Iterator<Item = usize>) -> Vec<usize> {
+pub(crate) fn build_batch_offsets(
+    batch_row_counts: impl Iterator<Item = usize>,
+) -> Vec<usize> {
     let mut offsets = vec![0usize];
     let mut acc = 0usize;
     for n in batch_row_counts {
@@ -1014,7 +1016,7 @@ fn build_batch_offsets(batch_row_counts: impl Iterator<Item = usize>) -> Vec<usi
 /// Maps a flat build-side row index to a `(batch, row)` pair using `offsets`
 /// (see [`build_batch_offsets`]).
 #[inline]
-fn flat_index_to_batch_row(offsets: &[usize], flat: usize) -> (usize, usize) {
+pub(crate) fn flat_index_to_batch_row(offsets: &[usize], flat: usize) -> (usize, usize) {
     // The largest `k` with `offsets[k] <= flat`. `partition_point` returns the
     // count of leading elements satisfying the predicate, i.e. `k + 1`. Using
     // `<=` (rather than `<`) naturally skips over empty batches.
