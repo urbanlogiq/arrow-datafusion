@@ -26,7 +26,7 @@ use std::task::Poll;
 use crate::joins::hash_join::exec::JoinLeftData;
 use crate::joins::hash_join::shared_bounds::SharedBoundsAccumulator;
 use crate::joins::utils::{
-    equal_rows_arr, get_final_indices_from_shared_bitmap, OnceFut,
+    equal_rows_arr_multi, get_final_indices_from_shared_bitmap, OnceFut,
 };
 use crate::joins::PartitionMode;
 use crate::{
@@ -34,10 +34,11 @@ use crate::{
     hash_utils::create_hashes,
     joins::join_hash_map::JoinHashMapOffset,
     joins::utils::{
-        adjust_indices_by_join_type, apply_join_filter_to_indices,
+        adjust_indices_by_join_type, apply_join_filter_to_indices_multi,
         build_batch_empty_build_side, build_batch_from_indices,
-        need_produce_result_in_final, BuildProbeJoinMetrics, ColumnIndex, JoinFilter,
-        JoinHashMapType, StatefulStreamResult,
+        build_batch_from_indices_multi, need_produce_result_in_final,
+        BuildProbeJoinMetrics, ColumnIndex, JoinFilter, JoinHashMapType,
+        StatefulStreamResult,
     },
     RecordBatchStream, SendableRecordBatchStream,
 };
@@ -272,7 +273,7 @@ impl RecordBatchStream for HashJoinStream {
 #[allow(clippy::too_many_arguments)]
 pub(super) fn lookup_join_hashmap(
     build_hashmap: &dyn JoinHashMapType,
-    build_side_values: &[ArrayRef],
+    build_side_values: &[Vec<ArrayRef>],
     probe_side_values: &[ArrayRef],
     null_equality: NullEquality,
     hashes_buffer: &[u64],
@@ -285,7 +286,7 @@ pub(super) fn lookup_join_hashmap(
     let build_indices: UInt64Array = build_indices.into();
     let probe_indices: UInt32Array = probe_indices.into();
 
-    let (build_indices, probe_indices) = equal_rows_arr(
+    let (build_indices, probe_indices) = equal_rows_arr_multi(
         &build_indices,
         &probe_indices,
         build_side_values,
@@ -489,7 +490,7 @@ impl HashJoinStream {
         if build_side.left_data.hash_map.is_empty() && self.filter.is_none() {
             let result = build_batch_empty_build_side(
                 &self.schema,
-                build_side.left_data.batch(),
+                build_side.left_data.schema(),
                 &state.batch,
                 &self.column_indices,
                 self.join_type,
@@ -515,14 +516,13 @@ impl HashJoinStream {
 
         // apply join filter if exists
         let (left_indices, right_indices) = if let Some(filter) = &self.filter {
-            apply_join_filter_to_indices(
-                build_side.left_data.batch(),
+            apply_join_filter_to_indices_multi(
+                build_side.left_data.batches(),
                 &state.batch,
                 left_indices,
                 right_indices,
                 filter,
                 JoinSide::Left,
-                None,
             )?
         } else {
             (left_indices, right_indices)
@@ -576,19 +576,24 @@ impl HashJoinStream {
         )?;
 
         let result = if self.join_type == JoinType::RightMark {
+            // RightMark output is the probe (right) columns plus a mark column; the
+            // build-side (left) data is never read here (see `build_join_schema`),
+            // so a single-batch call with an empty left placeholder is sufficient.
+            let empty_left =
+                RecordBatch::new_empty(Arc::clone(build_side.left_data.schema()));
             build_batch_from_indices(
                 &self.schema,
                 &state.batch,
-                build_side.left_data.batch(),
+                &empty_left,
                 &left_indices,
                 &right_indices,
                 &self.column_indices,
                 JoinSide::Right,
             )?
         } else {
-            build_batch_from_indices(
+            build_batch_from_indices_multi(
                 &self.schema,
-                build_side.left_data.batch(),
+                build_side.left_data.batches(),
                 &state.batch,
                 &left_indices,
                 &right_indices,
@@ -640,9 +645,9 @@ impl HashJoinStream {
         );
         let empty_right_batch = RecordBatch::new_empty(self.right.schema());
         // use the left and right indices to produce the batch result
-        let result = build_batch_from_indices(
+        let result = build_batch_from_indices_multi(
             &self.schema,
-            build_side.left_data.batch(),
+            build_side.left_data.batches(),
             &empty_right_batch,
             &left_side,
             &right_side,
