@@ -20,6 +20,7 @@
 mod boolean;
 mod bytes;
 pub mod bytes_view;
+mod fixed_size_binary;
 pub mod primitive;
 
 use std::mem::{self, size_of};
@@ -27,7 +28,9 @@ use std::mem::{self, size_of};
 use crate::aggregates::group_values::GroupValues;
 use crate::aggregates::group_values::multi_group_by::{
     boolean::BooleanGroupValueBuilder, bytes::ByteGroupValueBuilder,
-    bytes_view::ByteViewGroupValueBuilder, primitive::PrimitiveGroupValueBuilder,
+    bytes_view::ByteViewGroupValueBuilder,
+    fixed_size_binary::FixedSizeBinaryGroupValueBuilder,
+    primitive::PrimitiveGroupValueBuilder,
 };
 use arrow::array::{Array, ArrayRef, BooleanBufferBuilder};
 use arrow::compute::cast;
@@ -1052,6 +1055,12 @@ impl<const STREAMING: bool> GroupValues for GroupValuesColumn<STREAMING> {
                         let b = ByteGroupValueBuilder::<i64>::new(OutputType::Binary);
                         v.push(Box::new(b) as _)
                     }
+                    // A negative width is not a valid Arrow type; it falls
+                    // to the `dt` arm below, matching `supported_type`.
+                    &DataType::FixedSizeBinary(byte_width @ 0..) => {
+                        let b = FixedSizeBinaryGroupValueBuilder::new(byte_width);
+                        v.push(Box::new(b) as _)
+                    }
                     &DataType::Utf8View => {
                         let b = ByteViewGroupValueBuilder::<StringViewType>::new();
                         v.push(Box::new(b) as _)
@@ -1251,6 +1260,11 @@ fn supported_type(data_type: &DataType) -> bool {
             | DataType::LargeUtf8
             | DataType::Binary
             | DataType::LargeBinary
+            // Only non-negative widths: a negative width is not a valid
+            // Arrow type (no array can be constructed for it), and the
+            // dispatch in `GroupValuesColumn::intern` rejects it. Keep the
+            // two in lockstep.
+            | DataType::FixedSizeBinary(0..)
             | DataType::Date32
             | DataType::Date64
             | DataType::Time32(_)
@@ -1275,7 +1289,10 @@ enum Nulls {
 mod tests {
     use std::{collections::HashMap, sync::Arc};
 
-    use arrow::array::{ArrayRef, Int64Array, RecordBatch, StringArray, StringViewArray};
+    use arrow::array::{
+        ArrayRef, FixedSizeBinaryArray, Int64Array, RecordBatch, StringArray,
+        StringViewArray,
+    };
     use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
     use arrow::{compute::concat_batches, util::pretty::pretty_format_batches};
     use datafusion_common::utils::proxy::HashTableAllocExt;
@@ -1341,6 +1358,78 @@ mod tests {
         let actual_batch = RecordBatch::try_new(data_set.schema(), actual_batch).unwrap();
 
         check_result(&actual_batch, &data_set.expected_batch);
+    }
+
+    #[test]
+    fn test_intern_for_fixed_size_binary_group_values() {
+        // Two-column group by `(FixedSizeBinary(2), Int64)` exercising the
+        // vectorized intern path end-to-end (hashing included), with nulls,
+        // within-batch repeats and across-batch repeats.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::FixedSizeBinary(2), true),
+            Field::new("b", DataType::Int64, true),
+        ]));
+        let mut group_values =
+            GroupValuesColumn::<false>::try_new(Arc::clone(&schema)).unwrap();
+
+        fn fsb(values: Vec<Option<&[u8; 2]>>) -> ArrayRef {
+            Arc::new(
+                FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+                    values.into_iter(),
+                    2,
+                )
+                .unwrap(),
+            )
+        }
+
+        let batch1: Vec<ArrayRef> = vec![
+            fsb(vec![Some(b"aa"), Some(b"aa"), None, None, Some(b"bb")]),
+            Arc::new(Int64Array::from(vec![
+                Some(1),
+                Some(1),
+                None,
+                Some(2),
+                None,
+            ])),
+        ];
+        // Mix of groups repeated from batch1 and new groups
+        let batch2: Vec<ArrayRef> = vec![
+            fsb(vec![Some(b"aa"), Some(b"cc"), None, Some(b"bb")]),
+            Arc::new(Int64Array::from(vec![Some(1), Some(1), None, Some(3)])),
+        ];
+
+        group_values.intern(&batch1, &mut vec![]).unwrap();
+        group_values.intern(&batch2, &mut vec![]).unwrap();
+
+        let actual_batch = group_values.emit(EmitTo::All).unwrap();
+        let actual_batch =
+            RecordBatch::try_new(Arc::clone(&schema), actual_batch).unwrap();
+
+        let expected_batch = RecordBatch::try_new(
+            schema,
+            vec![
+                fsb(vec![
+                    Some(b"aa"),
+                    None,
+                    None,
+                    Some(b"bb"),
+                    Some(b"cc"),
+                    Some(b"bb"),
+                ]),
+                Arc::new(Int64Array::from(vec![
+                    Some(1),
+                    None,
+                    Some(2),
+                    None,
+                    Some(1),
+                    Some(3),
+                ])),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(actual_batch.num_rows(), expected_batch.num_rows());
+        check_result(&actual_batch, &expected_batch);
     }
 
     #[test]
