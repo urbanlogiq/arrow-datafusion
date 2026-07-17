@@ -1039,20 +1039,12 @@ impl<const STREAMING: bool> GroupValues for GroupValuesColumn<STREAMING> {
                             data_type
                         }
                     }
-                    &DataType::Utf8 => {
-                        let b = ByteGroupValueBuilder::<i32>::new(OutputType::Utf8);
+                    &DataType::Utf8 | &DataType::LargeUtf8 => {
+                        let b = ByteGroupValueBuilder::new(OutputType::Utf8);
                         v.push(Box::new(b) as _)
                     }
-                    &DataType::LargeUtf8 => {
-                        let b = ByteGroupValueBuilder::<i64>::new(OutputType::Utf8);
-                        v.push(Box::new(b) as _)
-                    }
-                    &DataType::Binary => {
-                        let b = ByteGroupValueBuilder::<i32>::new(OutputType::Binary);
-                        v.push(Box::new(b) as _)
-                    }
-                    &DataType::LargeBinary => {
-                        let b = ByteGroupValueBuilder::<i64>::new(OutputType::Binary);
+                    &DataType::Binary | &DataType::LargeBinary => {
+                        let b = ByteGroupValueBuilder::new(OutputType::Binary);
                         v.push(Box::new(b) as _)
                     }
                     // A negative width is not a valid Arrow type; it falls
@@ -1290,8 +1282,8 @@ mod tests {
     use std::{collections::HashMap, sync::Arc};
 
     use arrow::array::{
-        ArrayRef, FixedSizeBinaryArray, Int64Array, RecordBatch, StringArray,
-        StringViewArray,
+        ArrayRef, FixedSizeBinaryArray, Int64Array, LargeStringArray, RecordBatch,
+        StringArray, StringViewArray,
     };
     use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
     use arrow::{compute::concat_batches, util::pretty::pretty_format_batches};
@@ -1807,10 +1799,12 @@ mod tests {
                 Arc::new(col3) as _,
             ];
 
-            // Expected batch
+            // Expected batch. Note the `Utf8` input column is emitted as
+            // `LargeUtf8`: string group keys are always accumulated with
+            // 64-bit offsets.
             let schema = Arc::new(Schema::new(vec![
                 Field::new("a", DataType::Int64, true),
-                Field::new("b", DataType::Utf8, true),
+                Field::new("b", DataType::LargeUtf8, true),
                 Field::new("c", DataType::Utf8View, true),
             ]));
 
@@ -1836,7 +1830,7 @@ mod tests {
                 Some(34212),
             ]);
 
-            let col2 = StringArray::from(vec![
+            let col2 = LargeStringArray::from(vec![
                 // Repeated rows in batch
                 Some("string1"),
                 None,

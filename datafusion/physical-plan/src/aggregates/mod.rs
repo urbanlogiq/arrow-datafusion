@@ -406,8 +406,27 @@ impl PhysicalGroupBy {
         Aggregate::grouping_id_type(self.expr.len(), max_duplicate_ordinal(&self.groups))
     }
 
+    /// Returns the schema of the group values as they are interned and
+    /// emitted by the group values machinery of the aggregation streams.
+    ///
+    /// This differs from the output schema in that string and binary group
+    /// keys are widened to their internal 64-bit offset representation (see
+    /// `internal_group_key_type`). Output batches are narrowed back to the
+    /// declared output types after being sliced to `batch_size` rows.
     pub fn group_schema(&self, schema: &Schema) -> Result<SchemaRef> {
-        Ok(Arc::new(Schema::new(self.group_fields(schema)?)))
+        let fields = self
+            .group_fields(schema)?
+            .into_iter()
+            .map(|field| {
+                let wide = internal_group_key_type(field.data_type());
+                if wide == *field.data_type() {
+                    field
+                } else {
+                    Arc::new(field.as_ref().clone().with_data_type(wide))
+                }
+            })
+            .collect::<Vec<_>>();
+        Ok(Arc::new(Schema::new(fields)))
     }
 
     /// Returns the fields that are used as the grouping keys.
@@ -1768,6 +1787,23 @@ impl ExecutionPlan for AggregateExec {
 
 /// Creates the output schema for an [`AggregateExec`] containing the group by columns followed
 /// by the aggregate columns.
+/// The type used internally to intern and emit a group-by key of the given
+/// input type.
+///
+/// String and binary group keys are accumulated with 64-bit offsets
+/// (`LargeUtf8` / `LargeBinary`) so that the single array holding all
+/// distinct group keys is not limited to `i32::MAX` total bytes. This is an
+/// implementation detail of the aggregation streams: output batches are
+/// narrowed back to the declared output types after being sliced to
+/// `batch_size` rows, where the narrow representation always fits.
+pub(crate) fn internal_group_key_type(input_type: &DataType) -> DataType {
+    match input_type {
+        DataType::Utf8 => DataType::LargeUtf8,
+        DataType::Binary => DataType::LargeBinary,
+        other => other.clone(),
+    }
+}
+
 fn create_schema(
     input_schema: &Schema,
     group_by: &PhysicalGroupBy,
