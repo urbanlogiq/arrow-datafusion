@@ -27,8 +27,8 @@ use crate::aggregates::group_values::{GroupByMetrics, GroupValues, new_group_val
 use crate::aggregates::order::GroupOrderingFull;
 use crate::aggregates::{
     AggregateInputMode, AggregateMode, AggregateOutputMode, PhysicalGroupBy,
-    create_schema, evaluate_group_by, evaluate_many, evaluate_optional, group_id_array,
-    internal_group_key_type, max_duplicate_ordinal,
+    create_schema, emitted_group_key_type, evaluate_group_by, evaluate_many,
+    evaluate_optional, group_id_array, internal_group_key_type, max_duplicate_ordinal,
 };
 use crate::metrics::{BaselineMetrics, MetricBuilder, MetricCategory, RecordOutput};
 use crate::sorts::streaming_merge::{SortedSpillFile, StreamingMergeBuilder};
@@ -362,12 +362,17 @@ pub(crate) struct GroupedHashAggregateStream {
     // the execution.
     // ========================================================================
     schema: SchemaRef,
-    /// `schema` with string/binary group key columns widened to their
-    /// internal 64-bit offset representation (see [`internal_group_key_type`]).
+    /// `schema` with group key columns widened to the representation group
+    /// values are emitted with (see [`emitted_group_key_type`]).
     ///
     /// Batches built by [`Self::emit`] use this schema; they are narrowed
     /// back to `schema` after being sliced to `batch_size` rows for output.
     emit_schema: SchemaRef,
+    /// The schema of the interned group values (see
+    /// [`PhysicalGroupBy::group_schema`]); its field count is the number of
+    /// leading group key columns in emitted batches (the remaining columns
+    /// hold accumulator results/state)
+    group_schema: SchemaRef,
     input_schema: SchemaRef,
     input: SendableRecordBatchStream,
     mode: AggregateMode,
@@ -531,7 +536,8 @@ impl GroupedHashAggregateStream {
         // columns **and** the partial-state columns.
         //
         // Spilled batches hold the group keys as emitted by `group_values`,
-        // so the group key columns use the widened internal representation.
+        // so the group key columns use the widened emitted representation.
+        let num_group_columns = group_schema.fields().len();
         let spill_schema = widen_group_key_schema(
             &Arc::new(create_schema(
                 &agg.input().schema(),
@@ -539,13 +545,12 @@ impl GroupedHashAggregateStream {
                 &aggregate_exprs,
                 AggregateMode::Partial,
             )?),
-            group_schema.fields().len(),
+            num_group_columns,
         );
 
         // Batches built by `emit()` hold the group keys as emitted by
         // `group_values` and are narrowed to `agg_schema` on output.
-        let emit_schema =
-            widen_group_key_schema(&agg_schema, group_schema.fields().len());
+        let emit_schema = widen_group_key_schema(&agg_schema, num_group_columns);
 
         // Need to update the GROUP BY expressions to point to the correct column after schema change
         let merging_group_by_expr = agg_group_by
@@ -611,7 +616,7 @@ impl GroupedHashAggregateStream {
             _ => OutOfMemoryMode::ReportError,
         };
 
-        let group_values = new_group_values(group_schema, &group_ordering)?;
+        let group_values = new_group_values(Arc::clone(&group_schema), &group_ordering)?;
         let reservation = MemoryConsumer::new(name)
             // We interpret 'can spill' as 'can handle memory back pressure'.
             // This value needs to be set to true for the default memory pool implementations
@@ -686,6 +691,7 @@ impl GroupedHashAggregateStream {
         Ok(GroupedHashAggregateStream {
             schema: agg_schema,
             emit_schema,
+            group_schema,
             input_schema: agg.input().schema(),
             input,
             mode: agg.mode,
@@ -1163,6 +1169,21 @@ impl GroupedHashAggregateStream {
         }
         drop(timer);
 
+        // Most `GroupValues` implementations emit group keys directly in the
+        // widened types of `emitted_group_key_type`, but fallback
+        // implementations without widened emission (e.g. the row-format
+        // fallback emits `FixedSizeBinary` keys as-is) may not; coerce such
+        // columns to the emit schema.
+        for (array, field) in output
+            .iter_mut()
+            .zip(schema.fields())
+            .take(self.group_schema.fields().len())
+        {
+            if array.data_type() != field.data_type() {
+                *array = arrow::compute::cast(array, field.data_type())?;
+            }
+        }
+
         // emit reduces the memory usage. Ignore Err from update_memory_reservation. Even if it is
         // over the target memory size after emission, we can emit again rather than returning Err.
         let _ = self.update_memory_reservation();
@@ -1415,11 +1436,25 @@ impl GroupedHashAggregateStream {
             // in first-seen order, as required by `GroupOrderingFull`.
             // The pre-spill multi-column collector may use `vectorized_intern`, which
             // can assign new group ids out of input order under hash collisions.
+            //
+            // Recreating is also required whenever the merged batches hold
+            // group keys in a different type than the pre-spill collector
+            // interns: spilled batches use the *emitted* representation (see
+            // `emitted_group_key_type`), which differs for `FixedSizeBinary`
+            // keys (this also covers single-column `FixedSizeBinary`, which
+            // uses the multi-column collector).
             let group_schema = self
                 .spill_state
                 .merging_group_by
                 .group_schema(&self.spill_state.spill_schema)?;
-            if group_schema.fields().len() > 1 {
+            let same_types = group_schema.fields().len()
+                == self.group_schema.fields().len()
+                && group_schema
+                    .fields()
+                    .iter()
+                    .zip(self.group_schema.fields())
+                    .all(|(merge, original)| merge.data_type() == original.data_type());
+            if group_schema.fields().len() > 1 || !same_types {
                 self.group_values = new_group_values(group_schema, &self.group_ordering)?;
             }
 
@@ -1504,9 +1539,9 @@ impl GroupedHashAggregateStream {
     }
 }
 
-/// Returns `schema` with any string/binary fields among the leading
-/// `num_group_columns` group key fields widened to the internal group key
-/// representation (see [`internal_group_key_type`]).
+/// Returns `schema` with any of the leading `num_group_columns` group key
+/// fields widened to the representation group values are emitted with (see
+/// [`emitted_group_key_type`]).
 ///
 /// Returns the original schema when nothing needs widening.
 fn widen_group_key_schema(schema: &SchemaRef, num_group_columns: usize) -> SchemaRef {
@@ -1517,7 +1552,7 @@ fn widen_group_key_schema(schema: &SchemaRef, num_group_columns: usize) -> Schem
         .enumerate()
         .map(|(idx, field)| {
             if idx < num_group_columns {
-                let wide = internal_group_key_type(field.data_type());
+                let wide = emitted_group_key_type(field.data_type());
                 if wide != *field.data_type() {
                     changed = true;
                     return Arc::new(field.as_ref().clone().with_data_type(wide));
@@ -1645,6 +1680,44 @@ mod tests {
         // A batch already matching the target schema passes through untouched
         let untouched = narrow_group_key_columns(batch.clone(), &wide_schema)?;
         assert_eq!(untouched.schema(), wide_schema);
+
+        Ok(())
+    }
+
+    #[test]
+    fn narrow_group_key_columns_to_fixed_size_binary() -> Result<()> {
+        use arrow::buffer::{Buffer, NullBuffer, OffsetBuffer};
+
+        let wide_schema = Arc::new(Schema::new(vec![Field::new(
+            "k",
+            DataType::LargeBinary,
+            true,
+        )]));
+        let narrow_schema = Arc::new(Schema::new(vec![Field::new(
+            "k",
+            DataType::FixedSizeBinary(2),
+            true,
+        )]));
+        assert_eq!(widen_group_key_schema(&narrow_schema, 1), wide_schema);
+
+        // As emitted by `FixedSizeBinaryGroupValueBuilder`: `byte_width`
+        // stride offsets, nulls occupying zeroed placeholder bytes
+        let values = LargeBinaryArray::new(
+            OffsetBuffer::new(vec![0i64, 2, 4, 6, 8].into()),
+            Buffer::from(b"aa\0\0ccdd".as_slice()),
+            Some(NullBuffer::from(vec![true, false, true, true])),
+        );
+        let batch = RecordBatch::try_new(
+            Arc::clone(&wide_schema),
+            vec![Arc::new(values) as ArrayRef],
+        )?;
+
+        let narrowed = narrow_group_key_columns(batch.slice(1, 3), &narrow_schema)?;
+        assert_eq!(narrowed.schema(), narrow_schema);
+        let k = narrowed.column(0).as_fixed_size_binary();
+        assert!(k.is_null(0));
+        assert_eq!(k.value(1), b"cc");
+        assert_eq!(k.value(2), b"dd");
 
         Ok(())
     }

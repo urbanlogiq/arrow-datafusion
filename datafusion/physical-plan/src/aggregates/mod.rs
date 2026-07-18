@@ -1787,8 +1787,8 @@ impl ExecutionPlan for AggregateExec {
 
 /// Creates the output schema for an [`AggregateExec`] containing the group by columns followed
 /// by the aggregate columns.
-/// The type used internally to intern and emit a group-by key of the given
-/// input type.
+/// The type used internally to *intern* a group-by key of the given input
+/// type.
 ///
 /// String and binary group keys are accumulated with 64-bit offsets
 /// (`LargeUtf8` / `LargeBinary`) so that the single array holding all
@@ -1796,11 +1796,32 @@ impl ExecutionPlan for AggregateExec {
 /// implementation detail of the aggregation streams: output batches are
 /// narrowed back to the declared output types after being sliced to
 /// `batch_size` rows, where the narrow representation always fits.
+///
+/// See also [`emitted_group_key_type`] for the type group keys are *emitted*
+/// with, which additionally covers `FixedSizeBinary`.
 pub(crate) fn internal_group_key_type(input_type: &DataType) -> DataType {
     match input_type {
         DataType::Utf8 => DataType::LargeUtf8,
         DataType::Binary => DataType::LargeBinary,
         other => other.clone(),
+    }
+}
+
+/// The type used to *emit* a group-by key of the given input type.
+///
+/// In addition to the widened string/binary types of
+/// [`internal_group_key_type`], `FixedSizeBinary` keys are emitted as
+/// `LargeBinary`: Arrow requires the total value size of a
+/// `FixedSizeBinaryArray` to fit within `i32`, which the single array holding
+/// all distinct group keys can exceed. `FixedSizeBinary` keys are still
+/// *interned* as `FixedSizeBinary` (the specialized group column builder
+/// stores them without offsets); only the emitted arrays differ. Output
+/// batches are narrowed back to the declared output types after being sliced
+/// to `batch_size` rows.
+pub(crate) fn emitted_group_key_type(input_type: &DataType) -> DataType {
+    match input_type {
+        DataType::FixedSizeBinary(_) => DataType::LargeBinary,
+        other => internal_group_key_type(other),
     }
 }
 

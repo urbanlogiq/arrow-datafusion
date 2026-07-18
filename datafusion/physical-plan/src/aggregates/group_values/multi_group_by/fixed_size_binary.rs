@@ -20,9 +20,10 @@ use crate::aggregates::group_values::multi_group_by::{
 };
 use crate::aggregates::group_values::null_builder::MaybeNullBufferBuilder;
 use arrow::array::{
-    Array, ArrayData, ArrayRef, AsArray, BooleanBufferBuilder, FixedSizeBinaryArray,
+    Array, ArrayRef, AsArray, BooleanBufferBuilder, FixedSizeBinaryArray,
+    LargeBinaryArray,
 };
-use arrow::buffer::{Buffer, NullBuffer};
+use arrow::buffer::{Buffer, NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow::datatypes::DataType;
 use datafusion_common::utils::proxy::VecAllocExt;
 use datafusion_common::{Result, exec_datafusion_err};
@@ -35,10 +36,17 @@ use std::sync::Arc;
 ///
 /// 1. Efficient comparison of incoming rows to existing rows
 /// 2. Efficient construction of the final output array (the buffer is handed
-///    to [`FixedSizeBinaryArray`] as-is, no offsets needed)
+///    over as-is; offsets are only synthesized at emission)
 ///
 /// Null values occupy `byte_width` zeroed bytes in the buffer so that the
 /// value of row `i` is always stored at `i * byte_width..(i + 1) * byte_width`.
+///
+/// Group values are emitted as `LargeBinary` arrays rather than
+/// `FixedSizeBinary`: Arrow requires the total value size of a
+/// [`FixedSizeBinaryArray`] to fit within `i32`, which the single array
+/// holding all distinct group keys can exceed. Output batches are narrowed
+/// back to `FixedSizeBinary` after being sliced to `batch_size` rows (see
+/// `emitted_group_key_type`).
 pub struct FixedSizeBinaryGroupValueBuilder {
     /// The width in bytes of each value, from `DataType::FixedSizeBinary`
     byte_width: usize,
@@ -106,21 +114,22 @@ impl FixedSizeBinaryGroupValueBuilder {
 
     /// Assemble an output array from `values` + `nulls` parts
     ///
-    /// Builds via `ArrayData` with an explicit `len` because the length
-    /// cannot be derived from the values buffer when `byte_width == 0`
+    /// Emits a `LargeBinaryArray` with synthesized `byte_width`-stride
+    /// offsets; see the struct documentation for why `FixedSizeBinary`
+    /// cannot be emitted directly. `len` is passed explicitly because it
+    /// cannot be derived from the values buffer when `byte_width == 0`.
     fn build_array(
         byte_width: usize,
         values: Vec<u8>,
         nulls: Option<NullBuffer>,
         len: usize,
     ) -> ArrayRef {
-        let array_data = ArrayData::builder(DataType::FixedSizeBinary(byte_width as i32))
-            .len(len)
-            .add_buffer(Buffer::from(values))
-            .nulls(nulls)
-            .build()
-            .expect("buffer, nulls and len kept consistent on append");
-        Arc::new(FixedSizeBinaryArray::from(array_data))
+        let offsets: ScalarBuffer<i64> =
+            (0..=len as i64).map(|i| i * byte_width as i64).collect();
+        // SAFETY: the offsets are monotonically increasing by construction
+        // and bounded by `values.len()` (`len * byte_width`)
+        let offsets = unsafe { OffsetBuffer::new_unchecked(offsets) };
+        Arc::new(LargeBinaryArray::new(offsets, Buffer::from(values), nulls))
     }
 }
 
@@ -241,7 +250,10 @@ mod tests {
     use std::sync::Arc;
 
     use crate::aggregates::group_values::multi_group_by::fixed_size_binary::FixedSizeBinaryGroupValueBuilder;
-    use arrow::array::{ArrayRef, BooleanBufferBuilder, FixedSizeBinaryArray};
+    use arrow::array::{
+        ArrayRef, BooleanBufferBuilder, FixedSizeBinaryArray, LargeBinaryArray,
+    };
+    use arrow::datatypes::DataType;
 
     use super::GroupColumn;
 
@@ -263,6 +275,12 @@ mod tests {
             )
             .unwrap(),
         )
+    }
+
+    /// The expected form of emitted group values: `LargeBinary`, with nulls
+    /// still occupying `byte_width` (zeroed) bytes in the values buffer
+    fn make_emitted_array(values: Vec<Option<&[u8]>>) -> ArrayRef {
+        Arc::new(LargeBinaryArray::from(values))
     }
 
     #[test]
@@ -453,9 +471,12 @@ mod tests {
         builder.append_val(&array, 1).unwrap();
         builder.append_val(&array, 1).unwrap();
 
-        // (aa, null) remaining: null
+        // (aa, null) remaining: null. Nulls occupy `byte_width` zeroed bytes
+        // in the emitted values buffer, but array equality is logical and
+        // ignores the bytes behind null slots.
         let output = builder.take_n(2);
-        assert_eq!(&output, &array);
+        let expected = make_emitted_array(vec![Some(b"aa".as_slice()), None]);
+        assert_eq!(&output, &expected);
         assert_eq!(builder.len(), 1);
 
         // null, aa, null, aa
@@ -465,7 +486,7 @@ mod tests {
 
         // (null, aa) remaining: (null, aa)
         let output = builder.take_n(2);
-        let expected = make_array(vec![None, Some(b"aa".as_slice())], 2);
+        let expected = make_emitted_array(vec![None, Some(b"aa".as_slice())]);
         assert_eq!(&output, &expected);
         assert_eq!(builder.len(), 2);
 
@@ -486,7 +507,13 @@ mod tests {
         assert_eq!(builder.len(), 3);
 
         let output = Box::new(builder).build();
-        assert_eq!(&output, &array);
+        assert_eq!(output.data_type(), &DataType::LargeBinary);
+        let expected = make_emitted_array(vec![
+            Some(b"aa".as_slice()),
+            None,
+            Some(b"bb".as_slice()),
+        ]);
+        assert_eq!(&output, &expected);
     }
 
     #[test]
@@ -505,12 +532,12 @@ mod tests {
         assert!(!builder.equal_to(1, &array, 0));
 
         let output = builder.take_n(2);
-        let expected = make_array(vec![Some(b"".as_slice()), None], 0);
+        let expected = make_emitted_array(vec![Some(b"".as_slice()), None]);
         assert_eq!(&output, &expected);
         assert_eq!(builder.len(), 1);
 
         let output = Box::new(builder).build();
-        let expected = make_array(vec![Some(b"".as_slice())], 0);
+        let expected = make_emitted_array(vec![Some(b"".as_slice())]);
         assert_eq!(&output, &expected);
     }
 }

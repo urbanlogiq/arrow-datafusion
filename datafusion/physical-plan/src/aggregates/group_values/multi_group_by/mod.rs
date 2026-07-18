@@ -1282,8 +1282,8 @@ mod tests {
     use std::{collections::HashMap, sync::Arc};
 
     use arrow::array::{
-        ArrayRef, FixedSizeBinaryArray, Int64Array, LargeStringArray, RecordBatch,
-        StringArray, StringViewArray,
+        ArrayRef, FixedSizeBinaryArray, Int64Array, LargeBinaryArray, LargeStringArray,
+        RecordBatch, StringArray, StringViewArray,
     };
     use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
     use arrow::{compute::concat_batches, util::pretty::pretty_format_batches};
@@ -1393,20 +1393,31 @@ mod tests {
         group_values.intern(&batch1, &mut vec![]).unwrap();
         group_values.intern(&batch2, &mut vec![]).unwrap();
 
+        // `FixedSizeBinary` group keys are emitted as `LargeBinary` (Arrow
+        // limits `FixedSizeBinaryArray` to `i32::MAX` total value bytes)
+        let emitted_schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::LargeBinary, true),
+            Field::new("b", DataType::Int64, true),
+        ]));
+
         let actual_batch = group_values.emit(EmitTo::All).unwrap();
         let actual_batch =
-            RecordBatch::try_new(Arc::clone(&schema), actual_batch).unwrap();
+            RecordBatch::try_new(Arc::clone(&emitted_schema), actual_batch).unwrap();
+
+        fn lb(values: Vec<Option<&[u8]>>) -> ArrayRef {
+            Arc::new(LargeBinaryArray::from(values))
+        }
 
         let expected_batch = RecordBatch::try_new(
-            schema,
+            emitted_schema,
             vec![
-                fsb(vec![
-                    Some(b"aa"),
+                lb(vec![
+                    Some(b"aa".as_slice()),
                     None,
                     None,
-                    Some(b"bb"),
-                    Some(b"cc"),
-                    Some(b"bb"),
+                    Some(b"bb".as_slice()),
+                    Some(b"cc".as_slice()),
+                    Some(b"bb".as_slice()),
                 ]),
                 Arc::new(Int64Array::from(vec![
                     Some(1),
