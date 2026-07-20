@@ -49,20 +49,20 @@ use crate::{
 };
 
 use arrow::array::{
-    Array, BooleanArray, BooleanBufferBuilder, RecordBatchOptions, UInt32Array,
+    Array, AsArray, BooleanArray, BooleanBufferBuilder, RecordBatchOptions, UInt32Array,
     UInt64Array, new_null_array,
 };
 use arrow::buffer::BooleanBuffer;
 use arrow::compute::{
-    BatchCoalescer, concat_batches, filter, filter_record_batch, interleave_record_batch,
-    not, take, take_record_batch,
+    BatchCoalescer, concat, concat_batches, filter, filter_record_batch,
+    interleave_record_batch, not, take, take_record_batch,
 };
 use arrow::datatypes::{Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use arrow_schema::DataType;
 use datafusion_common::cast::as_boolean_array;
 use datafusion_common::{
-    JoinSide, Result, ScalarValue, Statistics, arrow_err, assert_eq_or_internal_err,
+    JoinSide, Result, ScalarValue, Statistics, assert_eq_or_internal_err,
     internal_datafusion_err, internal_err, project_schema, unwrap_or_internal_err,
 };
 use datafusion_execution::TaskContext;
@@ -1103,6 +1103,17 @@ pub(crate) struct NestedLoopJoinStream {
     /// Output buffer holds the join result to output. It will emit eagerly when
     /// the threshold is reached.
     output_buffer: Box<BatchCoalescer>,
+    /// Indices of output columns whose data type stores variable-length data
+    /// behind `i32` offsets (e.g. `Utf8`, `Binary`, `List`), possibly nested.
+    /// Used by [`Self::push_output_batch`] to keep `output_buffer` from
+    /// accumulating more than `i32::MAX` bytes per such column.
+    var_len_output_columns: Vec<usize>,
+    /// For each column in `var_len_output_columns`, an upper-bound estimate of
+    /// the variable-length bytes buffered in `output_buffer` since its buffer
+    /// was last finished. The estimate never resets on the coalescer's internal
+    /// batch completions, so it can only overcount (forcing a slightly early
+    /// finish), never undercount.
+    buffered_var_len_bytes: Vec<usize>,
     /// See comments in [`NLJState::Done`] for its purpose
     handled_empty_output: bool,
 
@@ -1382,6 +1393,14 @@ impl NestedLoopJoinStream {
         batch_size: usize,
         spill_state: SpillState,
     ) -> Self {
+        let var_len_output_columns: Vec<usize> = schema
+            .fields()
+            .iter()
+            .enumerate()
+            .filter(|(_, field)| contains_i32_offset_data(field.data_type()))
+            .map(|(idx, _)| idx)
+            .collect();
+        let buffered_var_len_bytes = vec![0; var_len_output_columns.len()];
         Self {
             output_schema: Arc::clone(&schema),
             join_filter: filter,
@@ -1392,6 +1411,8 @@ impl NestedLoopJoinStream {
             metrics,
             buffered_left_data: None,
             output_buffer: Box::new(BatchCoalescer::new(schema, batch_size)),
+            var_len_output_columns,
+            buffered_var_len_bytes,
             batch_size,
             current_right_batch: None,
             current_right_batch_matched: None,
@@ -1881,13 +1902,13 @@ impl NestedLoopJoinStream {
             "This state is yielding output for unmatched rows in the current right batch, so both the right batch and the bitmap must be present"
         );
         match self.process_right_unmatched() {
-            Ok(Some(batch)) => match self.output_buffer.push_batch(batch) {
+            Ok(Some(batch)) => match self.push_output_batch(batch) {
                 Ok(()) => {
                     debug_assert!(self.current_right_batch.is_none());
                     self.state = NLJState::FetchingRight;
                     ControlFlow::Continue(())
                 }
-                Err(e) => ControlFlow::Break(Poll::Ready(Some(arrow_err!(e)))),
+                Err(e) => ControlFlow::Break(Poll::Ready(Some(Err(e)))),
             },
             Ok(None) => {
                 debug_assert!(self.current_right_batch.is_none());
@@ -1917,7 +1938,7 @@ impl NestedLoopJoinStream {
             // Continue processing until we have processed all unmatched rows
             Ok(true) => ControlFlow::Continue(()),
             // We have finished processing all unmatched rows for this chunk
-            Ok(false) => match self.output_buffer.finish_buffered_batch() {
+            Ok(false) => match self.finish_output_buffer() {
                 Ok(()) => {
                     // Flush any completed batch before transitioning.
                     // This is critical for the memory-limited path: the
@@ -1953,7 +1974,7 @@ impl NestedLoopJoinStream {
                     }
                     ControlFlow::Continue(())
                 }
-                Err(e) => ControlFlow::Break(Poll::Ready(Some(arrow_err!(e)))),
+                Err(e) => ControlFlow::Break(Poll::Ready(Some(Err(e)))),
             },
             Err(e) => ControlFlow::Break(Poll::Ready(Some(Err(e)))),
         }
@@ -2033,9 +2054,9 @@ impl NestedLoopJoinStream {
                     self.join_type,
                     JoinSide::Right,
                 ) {
-                    Ok(Some(batch)) => match self.output_buffer.push_batch(batch) {
+                    Ok(Some(batch)) => match self.push_output_batch(batch) {
                         Ok(()) => ControlFlow::Continue(()),
-                        Err(e) => ControlFlow::Break(Poll::Ready(Some(arrow_err!(e)))),
+                        Err(e) => ControlFlow::Break(Poll::Ready(Some(Err(e)))),
                     },
                     Ok(None) => ControlFlow::Continue(()),
                     Err(e) => ControlFlow::Break(Poll::Ready(Some(Err(e)))),
@@ -2044,12 +2065,12 @@ impl NestedLoopJoinStream {
             Poll::Ready(Some(Err(e))) => ControlFlow::Break(Poll::Ready(Some(Err(e)))),
             Poll::Ready(None) => {
                 // All right batches replayed
-                match self.output_buffer.finish_buffered_batch() {
+                match self.finish_output_buffer() {
                     Ok(()) => {
                         self.state = NLJState::Done;
                         ControlFlow::Continue(())
                     }
-                    Err(e) => ControlFlow::Break(Poll::Ready(Some(arrow_err!(e)))),
+                    Err(e) => ControlFlow::Break(Poll::Ready(Some(Err(e)))),
                 }
             }
             Poll::Pending => ControlFlow::Break(Poll::Pending),
@@ -2139,7 +2160,7 @@ impl NestedLoopJoinStream {
             )?;
 
             if let Some(batch) = joined_batch {
-                self.output_buffer.push_batch(batch)?;
+                self.push_output_batch(batch)?;
             }
 
             self.left_probe_idx += l_row_count;
@@ -2148,11 +2169,11 @@ impl NestedLoopJoinStream {
         }
 
         let l_idx = self.left_probe_idx;
-        let joined_batch =
+        let joined_batches =
             self.process_single_left_row_join(&left_data, &right_batch, l_idx)?;
 
-        if let Some(batch) = joined_batch {
-            self.output_buffer.push_batch(batch)?;
+        for batch in joined_batches {
+            self.push_output_batch(batch)?;
         }
 
         // ==== Prepare for the next iteration ====
@@ -2180,6 +2201,11 @@ impl NestedLoopJoinStream {
         // and the entire right_batch. First, it calculates the index vectors, then
         // materializes the intermediate batch, and finally applies the join filter
         // to it.
+        //
+        // The result is capped at `batch_size` rows, so `i32` offset overflow is
+        // only possible for very large variable-length values (avg >
+        // `i32::MAX / batch_size` bytes per row). This path materializes via
+        // `take`, which returns a proper error (not a panic) in that case.
         // -----------------------------------------------------------
         let right_rows = right_batch.num_rows();
         let total_rows = l_row_count * right_rows;
@@ -2354,7 +2380,9 @@ impl NestedLoopJoinStream {
     }
 
     /// Process a single left row join with the current right batch.
-    /// Returns a RecordBatch containing the join results (None if empty)
+    /// Returns the join results, split into multiple batches if a large
+    /// build-side value has to be broadcast across many probe rows (see
+    /// [`build_row_join_batch`]). Empty if there is nothing to output.
     ///
     /// Side Effect: If the join type requires, left or right side matched bitmap
     /// will be set for matched indices.
@@ -2363,10 +2391,10 @@ impl NestedLoopJoinStream {
         left_data: &JoinLeftData,
         right_batch: &RecordBatch,
         l_index: usize,
-    ) -> Result<Option<RecordBatch>> {
+    ) -> Result<Vec<RecordBatch>> {
         let right_row_count = right_batch.num_rows();
         if right_row_count == 0 {
-            return Ok(None);
+            return Ok(vec![]);
         }
 
         // Resolve the flat left-row index to the batch it lives in and the row
@@ -2393,15 +2421,15 @@ impl NestedLoopJoinStream {
                 | JoinType::RightMark
                 | JoinType::RightSemi
         ) {
-            return Ok(None);
+            return Ok(vec![]);
         }
 
         if !cur_right_bitmap.has_true() {
             // If none of the pairs has passed the join predicate/filter
-            Ok(None)
+            Ok(vec![])
         } else {
             // Use the optimized approach similar to build_intermediate_batch_for_single_left_row
-            let join_batch = build_row_join_batch(
+            build_row_join_batch(
                 &self.output_schema,
                 left_batch,
                 left_row_idx,
@@ -2409,8 +2437,7 @@ impl NestedLoopJoinStream {
                 Some(cur_right_bitmap),
                 &self.column_indices,
                 JoinSide::Left,
-            )?;
-            Ok(join_batch)
+            )
         }
     }
 
@@ -2451,7 +2478,7 @@ impl NestedLoopJoinStream {
         if let Some(batch) =
             self.process_left_unmatched_range(left_data, start_idx, end_idx)?
         {
-            self.output_buffer.push_batch(batch)?;
+            self.push_output_batch(batch)?;
         }
 
         // ==== Prepare for the next iteration ====
@@ -2577,6 +2604,59 @@ impl NestedLoopJoinStream {
         None
     }
 
+    /// Push a batch into `output_buffer`, force-finishing the buffer first if
+    /// appending the batch could overflow `i32` offsets when the buffered rows
+    /// are later concatenated into a single completed batch.
+    ///
+    /// [`BatchCoalescer`] concatenates buffered batches to complete an output
+    /// batch, and that concatenation fails if a `Utf8`/`Binary`/`List` column
+    /// accumulates more than `i32::MAX` bytes. Chunked broadcast batches from
+    /// [`build_row_join_batch`] can individually approach that limit, so
+    /// without this check the coalescer would merge them back over it.
+    ///
+    /// All `output_buffer.push_batch()` calls must go through here.
+    fn push_output_batch(&mut self, batch: RecordBatch) -> Result<()> {
+        if !self.var_len_output_columns.is_empty() {
+            // If the size of a column can't be computed (not expected for the
+            // tracked types), fall back to usize::MAX: the buffer is then
+            // force-finished around every push, which disables coalescing but
+            // stays correct.
+            let incoming: Vec<usize> = self
+                .var_len_output_columns
+                .iter()
+                .map(|&idx| {
+                    batch
+                        .column(idx)
+                        .to_data()
+                        .get_slice_memory_size()
+                        .unwrap_or(usize::MAX)
+                })
+                .collect();
+            let would_overflow = self
+                .buffered_var_len_bytes
+                .iter()
+                .zip(&incoming)
+                .any(|(cur, inc)| cur.saturating_add(*inc) > MAX_BATCH_VAR_BYTES);
+            if would_overflow {
+                self.finish_output_buffer()?;
+            }
+            for (cur, inc) in self.buffered_var_len_bytes.iter_mut().zip(&incoming) {
+                *cur = cur.saturating_add(*inc);
+            }
+        }
+        self.output_buffer.push_batch(batch)?;
+        Ok(())
+    }
+
+    /// Force-complete `output_buffer`'s partially buffered rows and reset the
+    /// variable-length byte counters. All `output_buffer.finish_buffered_batch()`
+    /// calls must go through here so the counters stay in sync.
+    fn finish_output_buffer(&mut self) -> Result<()> {
+        self.output_buffer.finish_buffered_batch()?;
+        self.buffered_var_len_bytes.fill(0);
+        Ok(())
+    }
+
     /// After joining (l_index@left_buffer x current_right_batch), it will result
     /// in a bitmap (the same length as current_right_batch) as the join match
     /// result. Use this bitmap to update the global bitmap, for special join
@@ -2636,17 +2716,39 @@ fn apply_filter_to_row_join_batch(
     right_batch: &RecordBatch,
     filter: &JoinFilter,
 ) -> Result<BooleanArray> {
+    apply_filter_to_row_join_batch_with_limit(
+        left_batch,
+        l_index,
+        right_batch,
+        filter,
+        MAX_BATCH_VAR_BYTES,
+    )
+}
+
+/// Implementation of [`apply_filter_to_row_join_batch`] with an injectable
+/// broadcast byte limit (see [`build_row_join_batch_with_limit`]).
+fn apply_filter_to_row_join_batch_with_limit(
+    left_batch: &RecordBatch,
+    l_index: usize,
+    right_batch: &RecordBatch,
+    filter: &JoinFilter,
+    broadcast_byte_limit: usize,
+) -> Result<BooleanArray> {
     debug_assert!(left_batch.num_rows() != 0 && right_batch.num_rows() != 0);
 
-    let intermediate_batch = if filter.schema.fields().is_empty() {
+    let intermediate_batches = if filter.schema.fields().is_empty() {
         // If filter is constant (e.g. literal `true`), empty batch can be used
         // in the later filter step.
-        create_record_batch_with_empty_schema(
+        vec![create_record_batch_with_empty_schema(
             Arc::new((*filter.schema).clone()),
             right_batch.num_rows(),
-        )?
+        )?]
     } else {
-        build_row_join_batch(
+        // The intermediate batch is split into chunks if broadcasting a large
+        // left value across the right batch would overflow `i32` offsets. The
+        // chunks partition the right batch in order, so the per-chunk filter
+        // masks concatenate back into a mask for the whole right batch.
+        build_row_join_batch_with_limit(
             &filter.schema,
             left_batch,
             l_index,
@@ -2654,20 +2756,35 @@ fn apply_filter_to_row_join_batch(
             None,
             &filter.column_indices,
             JoinSide::Left,
+            broadcast_byte_limit,
         )?
-        .ok_or_else(|| internal_datafusion_err!("This function assume input batch is not empty, so the intermediate batch can't be empty too"))?
     };
 
-    let filter_result = filter
-        .expression()
-        .evaluate(&intermediate_batch)?
-        .into_array(intermediate_batch.num_rows())?;
-    let filter_arr = as_boolean_array(&filter_result)?;
+    if intermediate_batches.is_empty() {
+        return internal_err!(
+            "This function assume input batch is not empty, so the intermediate batch can't be empty too"
+        );
+    }
 
-    // Convert boolean array with potential nulls into a unified mask bitmap
-    let bitmap_combined = boolean_mask_from_filter(filter_arr);
+    let mut masks = Vec::with_capacity(intermediate_batches.len());
+    for intermediate_batch in intermediate_batches {
+        let filter_result = filter
+            .expression()
+            .evaluate(&intermediate_batch)?
+            .into_array(intermediate_batch.num_rows())?;
+        let filter_arr = as_boolean_array(&filter_result)?;
 
-    Ok(bitmap_combined)
+        // Convert boolean array with potential nulls into a unified mask bitmap
+        masks.push(boolean_mask_from_filter(filter_arr));
+    }
+
+    if masks.len() == 1 {
+        Ok(masks.swap_remove(0))
+    } else {
+        let mask_refs: Vec<&dyn Array> =
+            masks.iter().map(|mask| mask as &dyn Array).collect();
+        Ok(as_boolean_array(&concat(&mask_refs)?)?.clone())
+    }
 }
 
 /// Convert a boolean filter array into a unified mask bitmap.
@@ -2731,7 +2848,115 @@ fn boolean_mask_from_filter(filter_arr: &BooleanArray) -> BooleanArray {
 /// ----
 /// 1 20
 /// 1 40
+/// `Utf8`/`Binary` arrays use `i32` offsets, so a single array's values buffer
+/// cannot hold more than `i32::MAX` bytes. Broadcasting one build-side value
+/// across `n` output rows materializes `value_len * n` bytes, which must stay
+/// under this limit (`OffsetBuffer::from_repeated_length` panics otherwise).
+/// The same limit applies when [`BatchCoalescer`] concatenates buffered
+/// batches into one completed output batch.
+const MAX_BATCH_VAR_BYTES: usize = i32::MAX as usize;
+
+/// Returns true if the data type (or any nested child type) stores
+/// variable-length data behind `i32` offsets (`Utf8`, `Binary`, `List`, `Map`),
+/// i.e. types for which a single array is capped at `i32::MAX` bytes/elements
+/// and can therefore overflow when many rows are materialized into one array.
+fn contains_i32_offset_data(data_type: &DataType) -> bool {
+    match data_type {
+        DataType::Utf8 | DataType::Binary | DataType::List(_) | DataType::Map(_, _) => {
+            true
+        }
+        DataType::LargeList(field) | DataType::FixedSizeList(field, _) => {
+            contains_i32_offset_data(field.data_type())
+        }
+        DataType::Struct(fields) => fields
+            .iter()
+            .any(|field| contains_i32_offset_data(field.data_type())),
+        DataType::Dictionary(_, value_type) => contains_i32_offset_data(value_type),
+        DataType::RunEndEncoded(_, values) => {
+            contains_i32_offset_data(values.data_type())
+        }
+        DataType::Union(fields, _) => fields
+            .iter()
+            .any(|(_, field)| contains_i32_offset_data(field.data_type())),
+        _ => false,
+    }
+}
+
+/// Compute the maximum number of rows one output batch may contain when
+/// broadcasting the `build_side_index`-th build row, such that no
+/// `Utf8`/`Binary` build column's repeated value exceeds `byte_limit` total
+/// bytes (`i32` offset overflow otherwise).
+///
+/// Other build column types either have no `i32` offsets (primitives, views,
+/// `Large*`), or are broadcast via `take`, which returns a proper error
+/// instead of panicking on offset overflow.
+fn max_broadcast_rows(
+    build_side_batch: &RecordBatch,
+    build_side_index: usize,
+    col_indices: &[ColumnIndex],
+    build_side: JoinSide,
+    byte_limit: usize,
+) -> usize {
+    let mut max_rows = usize::MAX;
+    for column_index in col_indices {
+        if column_index.side != build_side {
+            continue;
+        }
+        let array = build_side_batch.column(column_index.index);
+        if array.is_null(build_side_index) {
+            continue;
+        }
+        let value_len = match array.data_type() {
+            DataType::Utf8 => array.as_string::<i32>().value(build_side_index).len(),
+            DataType::Binary => array.as_binary::<i32>().value(build_side_index).len(),
+            _ => continue,
+        };
+        if value_len == 0 {
+            continue;
+        }
+        max_rows = max_rows.min(byte_limit / value_len);
+    }
+    // A single row is always representable: the value comes from an existing
+    // i32-offset array, so its length fits in an i32.
+    max_rows.max(1)
+}
+
+/// See [`build_row_join_batch_with_limit`]. This wrapper applies the real
+/// `i32` offset limit.
 fn build_row_join_batch(
+    output_schema: &Schema,
+    build_side_batch: &RecordBatch,
+    build_side_index: usize,
+    probe_side_batch: &RecordBatch,
+    probe_side_filter: Option<BooleanArray>,
+    col_indices: &[ColumnIndex],
+    build_side: JoinSide,
+) -> Result<Vec<RecordBatch>> {
+    build_row_join_batch_with_limit(
+        output_schema,
+        build_side_batch,
+        build_side_index,
+        probe_side_batch,
+        probe_side_filter,
+        col_indices,
+        build_side,
+        MAX_BATCH_VAR_BYTES,
+    )
+}
+
+/// Join a single build-side row with the (filtered) probe-side batch, by
+/// broadcasting the build row across the probe rows.
+///
+/// The result is split into multiple batches when broadcasting a large
+/// `Utf8`/`Binary` build value would otherwise overflow the array's `i32`
+/// offsets (each batch's repeated value stays within `broadcast_byte_limit`
+/// total bytes). In the common case of small values a single batch is
+/// returned; an empty `Vec` means there is nothing to output.
+///
+/// `broadcast_byte_limit` is injectable so tests can exercise the chunking
+/// without allocating gigabytes; production code uses [`build_row_join_batch`].
+#[expect(clippy::too_many_arguments)]
+fn build_row_join_batch_with_limit(
     output_schema: &Schema,
     build_side_batch: &RecordBatch,
     build_side_index: usize,
@@ -2742,7 +2967,8 @@ fn build_row_join_batch(
     // If the build side is left or right, used to interpret the side information
     // in `col_indices`
     build_side: JoinSide,
-) -> Result<Option<RecordBatch>> {
+    broadcast_byte_limit: usize,
+) -> Result<Vec<RecordBatch>> {
     debug_assert!(build_side != JoinSide::None);
 
     // TODO(perf): since the output might be projection of right batch, this
@@ -2754,7 +2980,7 @@ fn build_row_join_batch(
     };
 
     if filtered_probe_batch.num_rows() == 0 {
-        return Ok(None);
+        return Ok(vec![]);
     }
 
     // Edge case: downstream operator does not require any columns from this NLJ,
@@ -2765,19 +2991,74 @@ fn build_row_join_batch(
     //  LEFT OUTER JOIN tab2 AS cor1
     //  ON ( NULL ) IS NULL;
     if output_schema.fields.is_empty() {
-        return Ok(Some(create_record_batch_with_empty_schema(
+        return Ok(vec![create_record_batch_with_empty_schema(
             Arc::new(output_schema.clone()),
             filtered_probe_batch.num_rows(),
-        )?));
+        )?]);
     }
 
+    let num_rows = filtered_probe_batch.num_rows();
+    let chunk_rows = max_broadcast_rows(
+        build_side_batch,
+        build_side_index,
+        col_indices,
+        build_side,
+        broadcast_byte_limit,
+    );
+
+    // Common case: all build values are small enough to broadcast across the
+    // whole probe batch in one output batch
+    if chunk_rows >= num_rows {
+        return Ok(vec![broadcast_build_row(
+            output_schema,
+            build_side_batch,
+            build_side_index,
+            filtered_probe_batch,
+            col_indices,
+            build_side,
+        )?]);
+    }
+
+    let mut batches = Vec::with_capacity(num_rows.div_ceil(chunk_rows));
+    let mut offset = 0;
+    while offset < num_rows {
+        let len = chunk_rows.min(num_rows - offset);
+        let probe_chunk = filtered_probe_batch.slice(offset, len);
+        batches.push(broadcast_build_row(
+            output_schema,
+            build_side_batch,
+            build_side_index,
+            &probe_chunk,
+            col_indices,
+            build_side,
+        )?);
+        offset += len;
+    }
+    Ok(batches)
+}
+
+/// Build one output batch pairing the `build_side_index`-th build row with
+/// every row of `probe_batch`: build-side columns are broadcast to the probe
+/// batch length, probe-side columns are passed through.
+///
+/// The caller is responsible for keeping `probe_batch` small enough that the
+/// broadcast `Utf8`/`Binary` columns do not overflow `i32` offsets (see
+/// [`max_broadcast_rows`]).
+fn broadcast_build_row(
+    output_schema: &Schema,
+    build_side_batch: &RecordBatch,
+    build_side_index: usize,
+    probe_batch: &RecordBatch,
+    col_indices: &[ColumnIndex],
+    build_side: JoinSide,
+) -> Result<RecordBatch> {
     let mut columns: Vec<Arc<dyn Array>> =
         Vec::with_capacity(output_schema.fields().len());
 
     for column_index in col_indices {
         let array = if column_index.side == build_side {
-            // Broadcast the single build-side row to match the filtered
-            // probe-side batch length
+            // Broadcast the single build-side row to match the probe-side
+            // batch length
             let original_left_array = build_side_batch.column(column_index.index);
 
             // Use `arrow::compute::take` directly for `List(Utf8View)` rather
@@ -2791,7 +3072,7 @@ fn build_row_join_batch(
                 {
                     let indices_iter = std::iter::repeat_n(
                         build_side_index as u64,
-                        filtered_probe_batch.num_rows(),
+                        probe_batch.num_rows(),
                     );
                     let indices_array = UInt64Array::from_iter_values(indices_iter);
                     take(original_left_array.as_ref(), &indices_array, None)?
@@ -2801,21 +3082,21 @@ fn build_row_join_batch(
                         original_left_array.as_ref(),
                         build_side_index,
                     )?;
-                    scalar_value.to_array_of_size(filtered_probe_batch.num_rows())?
+                    scalar_value.to_array_of_size(probe_batch.num_rows())?
                 }
             }
         } else {
-            // Take the filtered probe-side column using compute::take
-            Arc::clone(filtered_probe_batch.column(column_index.index))
+            // Take the probe-side column as is
+            Arc::clone(probe_batch.column(column_index.index))
         };
 
         columns.push(array);
     }
 
-    Ok(Some(RecordBatch::try_new(
+    Ok(RecordBatch::try_new(
         Arc::new(output_schema.clone()),
         columns,
-    )?))
+    )?)
 }
 
 /// Special case for `PlaceHolderRowExec`
@@ -2964,7 +3245,9 @@ fn build_unmatched_batch(
             debug_assert_ne!(batch_side, JoinSide::None);
             let opposite_side = batch_side.negate();
 
-            build_row_join_batch(
+            // The broadcast row is all nulls (zero variable-length bytes), so
+            // `build_row_join_batch` never splits the result into chunks.
+            let mut batches = build_row_join_batch(
                 output_schema,
                 &left_null_batch,
                 0,
@@ -2972,7 +3255,13 @@ fn build_unmatched_batch(
                 Some(flipped_bitmap),
                 col_indices,
                 opposite_side,
-            )
+            )?;
+            if batches.len() > 1 {
+                return internal_err!(
+                    "broadcasting an all-null row must produce at most one batch"
+                );
+            }
+            Ok(batches.pop())
         }
         JoinType::RightSemi
         | JoinType::RightAnti
@@ -4062,5 +4351,356 @@ pub(crate) mod tests {
         +----+----+-----+-------+
         "));
         Ok(())
+    }
+
+    /// Tests for chunking the broadcast of large variable-length build values,
+    /// which would otherwise overflow `i32` offsets ("offset overflow" panic in
+    /// `OffsetBuffer::from_repeated_length`).
+    mod broadcast_chunking {
+        use super::*;
+        use arrow::array::{BinaryArray, Int32Array};
+        use datafusion_common::cast::as_int32_array;
+        use datafusion_physical_expr::expressions::IsNotNullExpr;
+
+        /// Build (left) side with one row holding a 10-byte binary payload,
+        /// probe (right) side with 10 rows, and the joined output layout
+        fn broadcast_test_inputs() -> (RecordBatch, RecordBatch, Schema, Vec<ColumnIndex>)
+        {
+            let left_schema = Arc::new(Schema::new(vec![
+                Field::new("a1", DataType::Int32, true),
+                Field::new("blob", DataType::Binary, true),
+            ]));
+            let left_batch = RecordBatch::try_new(
+                left_schema,
+                vec![
+                    Arc::new(Int32Array::from(vec![5])),
+                    Arc::new(BinaryArray::from_opt_vec(vec![Some(b"0123456789")])),
+                ],
+            )
+            .unwrap();
+
+            let right_schema =
+                Arc::new(Schema::new(vec![Field::new("b2", DataType::Int32, true)]));
+            let right_batch = RecordBatch::try_new(
+                right_schema,
+                vec![Arc::new(Int32Array::from((0..10).collect::<Vec<_>>()))],
+            )
+            .unwrap();
+
+            let output_schema = Schema::new(vec![
+                Field::new("a1", DataType::Int32, true),
+                Field::new("blob", DataType::Binary, true),
+                Field::new("b2", DataType::Int32, true),
+            ]);
+            let col_indices = vec![
+                ColumnIndex {
+                    index: 0,
+                    side: JoinSide::Left,
+                },
+                ColumnIndex {
+                    index: 1,
+                    side: JoinSide::Left,
+                },
+                ColumnIndex {
+                    index: 0,
+                    side: JoinSide::Right,
+                },
+            ];
+            (left_batch, right_batch, output_schema, col_indices)
+        }
+
+        #[test]
+        fn chunks_large_broadcast_values() -> Result<()> {
+            let (left, right, output_schema, col_indices) = broadcast_test_inputs();
+
+            // The build value is 10 bytes, so a 32-byte limit allows 3 rows
+            // per chunk
+            let chunked = build_row_join_batch_with_limit(
+                &output_schema,
+                &left,
+                0,
+                &right,
+                None,
+                &col_indices,
+                JoinSide::Left,
+                32,
+            )?;
+            assert_eq!(
+                chunked.iter().map(|b| b.num_rows()).collect::<Vec<_>>(),
+                vec![3, 3, 3, 1]
+            );
+
+            // The chunked result must concatenate back to the unchunked result
+            let unchunked = build_row_join_batch_with_limit(
+                &output_schema,
+                &left,
+                0,
+                &right,
+                None,
+                &col_indices,
+                JoinSide::Left,
+                usize::MAX,
+            )?;
+            assert_eq!(unchunked.len(), 1);
+            let concatenated = concat_batches(&Arc::new(output_schema), &chunked)?;
+            assert_eq!(concatenated, unchunked[0]);
+            Ok(())
+        }
+
+        #[test]
+        fn chunks_after_probe_filter() -> Result<()> {
+            let (left, right, output_schema, col_indices) = broadcast_test_inputs();
+
+            // Keep only even probe rows: 0, 2, 4, 6, 8
+            let mask =
+                BooleanArray::from((0..10).map(|i| i % 2 == 0).collect::<Vec<_>>());
+            let chunked = build_row_join_batch_with_limit(
+                &output_schema,
+                &left,
+                0,
+                &right,
+                Some(mask.clone()),
+                &col_indices,
+                JoinSide::Left,
+                32,
+            )?;
+            assert_eq!(
+                chunked.iter().map(|b| b.num_rows()).collect::<Vec<_>>(),
+                vec![3, 2]
+            );
+
+            let concatenated =
+                concat_batches(&Arc::new(output_schema.clone()), &chunked)?;
+            let unchunked = build_row_join_batch_with_limit(
+                &output_schema,
+                &left,
+                0,
+                &right,
+                Some(mask),
+                &col_indices,
+                JoinSide::Left,
+                usize::MAX,
+            )?;
+            assert_eq!(concatenated, unchunked[0]);
+            assert_eq!(
+                as_int32_array(concatenated.column(2))?.values(),
+                &[0, 2, 4, 6, 8]
+            );
+            Ok(())
+        }
+
+        #[test]
+        fn broadcast_edge_cases() -> Result<()> {
+            let (left, right, output_schema, col_indices) = broadcast_test_inputs();
+
+            // A null build value contributes no bytes: never chunks, even with
+            // a 1-byte limit
+            let null_left = RecordBatch::try_new(
+                left.schema(),
+                vec![
+                    Arc::new(Int32Array::from(vec![5])),
+                    Arc::new(BinaryArray::from_opt_vec(vec![None])),
+                ],
+            )?;
+            let batches = build_row_join_batch_with_limit(
+                &output_schema,
+                &null_left,
+                0,
+                &right,
+                None,
+                &col_indices,
+                JoinSide::Left,
+                1,
+            )?;
+            assert_eq!(batches.len(), 1);
+            assert_eq!(batches[0].num_rows(), 10);
+
+            // A value longer than the limit degrades to one row per chunk
+            let batches = build_row_join_batch_with_limit(
+                &output_schema,
+                &left,
+                0,
+                &right,
+                None,
+                &col_indices,
+                JoinSide::Left,
+                5,
+            )?;
+            assert_eq!(batches.len(), 10);
+            assert!(batches.iter().all(|b| b.num_rows() == 1));
+
+            // An all-filtered probe batch produces no output
+            let batches = build_row_join_batch_with_limit(
+                &output_schema,
+                &left,
+                0,
+                &right,
+                Some(BooleanArray::from(vec![false; 10])),
+                &col_indices,
+                JoinSide::Left,
+                32,
+            )?;
+            assert!(batches.is_empty());
+            Ok(())
+        }
+
+        #[test]
+        fn chunked_filter_mask_matches_unchunked() -> Result<()> {
+            let (left, _, _, _) = broadcast_test_inputs();
+
+            // Right batch with a null to exercise null handling of the filter
+            // result across chunk boundaries
+            let right_schema =
+                Arc::new(Schema::new(vec![Field::new("b2", DataType::Int32, true)]));
+            let right = RecordBatch::try_new(
+                right_schema,
+                vec![Arc::new(Int32Array::from(
+                    (0..10)
+                        .map(|i| if i == 5 { None } else { Some(i) })
+                        .collect::<Vec<_>>(),
+                ))],
+            )?;
+
+            // Filter references the left blob so the intermediate batch has to
+            // broadcast it, and evaluates `b2 >= 4` on the right column
+            let filter_schema = Schema::new(vec![
+                Field::new("blob", DataType::Binary, true),
+                Field::new("b2", DataType::Int32, true),
+            ]);
+            let column_indices = vec![
+                ColumnIndex {
+                    index: 1,
+                    side: JoinSide::Left,
+                },
+                ColumnIndex {
+                    index: 0,
+                    side: JoinSide::Right,
+                },
+            ];
+            let expr = Arc::new(BinaryExpr::new(
+                Arc::new(Column::new("b2", 1)),
+                Operator::GtEq,
+                Arc::new(Literal::new(ScalarValue::Int32(Some(4)))),
+            )) as Arc<dyn PhysicalExpr>;
+            let filter = JoinFilter::new(expr, column_indices, Arc::new(filter_schema));
+
+            let chunked =
+                apply_filter_to_row_join_batch_with_limit(&left, 0, &right, &filter, 32)?;
+            let unchunked = apply_filter_to_row_join_batch_with_limit(
+                &left,
+                0,
+                &right,
+                &filter,
+                usize::MAX,
+            )?;
+            assert_eq!(chunked, unchunked);
+
+            // `b2 >= 4` is null for the null row, which must combine to false
+            let expected =
+                BooleanArray::from((0..10).map(|i| i >= 4 && i != 5).collect::<Vec<_>>());
+            assert_eq!(chunked, expected);
+            Ok(())
+        }
+
+        #[test]
+        fn i32_offset_type_detection() {
+            use arrow::datatypes::Fields;
+
+            assert!(contains_i32_offset_data(&DataType::Utf8));
+            assert!(contains_i32_offset_data(&DataType::Binary));
+            assert!(contains_i32_offset_data(&DataType::List(Arc::new(
+                Field::new_list_field(DataType::Int32, true)
+            ))));
+            assert!(contains_i32_offset_data(&DataType::LargeList(Arc::new(
+                Field::new_list_field(DataType::Utf8, true)
+            ))));
+            assert!(contains_i32_offset_data(&DataType::Struct(Fields::from(
+                vec![Field::new("a", DataType::Binary, true)]
+            ))));
+
+            assert!(!contains_i32_offset_data(&DataType::Int32));
+            assert!(!contains_i32_offset_data(&DataType::LargeUtf8));
+            assert!(!contains_i32_offset_data(&DataType::Utf8View));
+            assert!(!contains_i32_offset_data(&DataType::LargeList(Arc::new(
+                Field::new_list_field(DataType::Int64, true)
+            ))));
+        }
+
+        /// Reproducer for the "offset overflow" panic: broadcasting a single
+        /// large `Binary` value across a whole probe batch used to overflow
+        /// the `i32` offsets both of the filter's intermediate batch and of
+        /// the output batch.
+        ///
+        /// Ignored by default: it materializes ~2.5 GiB of join output
+        /// (several GiB peak RSS). Run with:
+        /// `cargo test -p datafusion-physical-plan --release -- --ignored nlj_broadcast_offset_overflow`
+        #[tokio::test]
+        #[ignore = "allocates several GiB of memory"]
+        async fn nlj_broadcast_offset_overflow() -> Result<()> {
+            let value = vec![42u8; 300 * 1024];
+            let left_schema = Arc::new(Schema::new(vec![Field::new(
+                "blob",
+                DataType::Binary,
+                true,
+            )]));
+            let left_batch = RecordBatch::try_new(
+                Arc::clone(&left_schema),
+                vec![Arc::new(BinaryArray::from_opt_vec(vec![Some(&value)]))],
+            )?;
+            let left: Arc<dyn ExecutionPlan> =
+                TestMemoryExec::try_new_exec(&[vec![left_batch]], left_schema, None)?;
+
+            // A single 8192-row probe batch: 300 KiB * 8192 > i32::MAX bytes
+            let n_right = 8192;
+            let right_schema =
+                Arc::new(Schema::new(vec![Field::new("b2", DataType::Int32, true)]));
+            let right_batch = RecordBatch::try_new(
+                Arc::clone(&right_schema),
+                vec![Arc::new(Int32Array::from(
+                    (0..n_right as i32).collect::<Vec<_>>(),
+                ))],
+            )?;
+            let right: Arc<dyn ExecutionPlan> =
+                TestMemoryExec::try_new_exec(&[vec![right_batch]], right_schema, None)?;
+
+            // The filter references the blob column so the filter's
+            // intermediate batch also broadcasts the large value
+            let filter_schema =
+                Schema::new(vec![Field::new("blob", DataType::Binary, true)]);
+            let filter_expr =
+                Arc::new(IsNotNullExpr::new(Arc::new(Column::new("blob", 0))))
+                    as Arc<dyn PhysicalExpr>;
+            let filter = JoinFilter::new(
+                filter_expr,
+                vec![ColumnIndex {
+                    index: 0,
+                    side: JoinSide::Left,
+                }],
+                Arc::new(filter_schema),
+            );
+
+            let join = NestedLoopJoinExec::try_new(
+                left,
+                right,
+                Some(filter),
+                &JoinType::Inner,
+                None,
+            )?;
+            let ctx = Arc::new(TaskContext::default());
+            let batch_size = ctx.session_config().batch_size();
+            let stream = join.execute(0, ctx)?;
+            let batches = common::collect(stream).await?;
+
+            let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+            assert_eq!(total_rows, n_right);
+            for batch in &batches {
+                assert!(batch.num_rows() <= batch_size);
+                let blob = batch.column(0).as_binary::<i32>();
+                // Each output batch stays under the i32 offset limit
+                assert!(blob.value_data().len() <= i32::MAX as usize);
+                assert_eq!(blob.value(0).len(), value.len());
+            }
+            Ok(())
+        }
     }
 }
