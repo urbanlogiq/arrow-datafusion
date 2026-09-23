@@ -148,6 +148,47 @@ impl TDigest {
         self.max_size
     }
 
+    /// The sum of the values merged into this digest.
+    #[inline]
+    pub fn sum(&self) -> f64 {
+        self.sum
+    }
+
+    /// The centroids of this digest, in ascending order of mean.
+    #[inline]
+    pub fn centroids(&self) -> &[Centroid] {
+        &self.centroids
+    }
+
+    /// Build a digest from its parts, as [`Self::to_scalar_state()`] lays
+    /// them out. `centroids` must be in ascending order of mean.
+    ///
+    /// # Correctness
+    ///
+    /// Providing parts that did not come from a digest results in undefined
+    /// behaviour and may panic.
+    pub fn from_parts(
+        max_size: usize,
+        sum: f64,
+        count: f64,
+        max: f64,
+        min: f64,
+        centroids: Vec<Centroid>,
+    ) -> Self {
+        if min.is_finite() && max.is_finite() {
+            assert!(max.total_cmp(&min).is_ge());
+        }
+
+        Self {
+            max_size,
+            sum,
+            count,
+            max,
+            min,
+            centroids,
+        }
+    }
+
     /// Size in bytes including `Self`.
     pub fn size(&self) -> usize {
         size_of_val(self) + (size_of::<Centroid>() * self.centroids.capacity())
@@ -595,21 +636,14 @@ impl TDigest {
             v => panic!("invalid centroids type {v:?}"),
         };
 
-        let max = cast_scalar_f64!(&state[3]);
-        let min = cast_scalar_f64!(&state[4]);
-
-        if min.is_finite() && max.is_finite() {
-            assert!(max.total_cmp(&min).is_ge());
-        }
-
-        Self {
+        Self::from_parts(
             max_size,
-            sum: cast_scalar_f64!(state[1]),
-            count: cast_scalar_f64!(state[2]),
-            max,
-            min,
+            cast_scalar_f64!(state[1]),
+            cast_scalar_f64!(state[2]),
+            cast_scalar_f64!(&state[3]),
+            cast_scalar_f64!(&state[4]),
             centroids,
-        }
+        )
     }
 }
 
