@@ -1874,6 +1874,13 @@ pub(crate) fn asymmetric_join_output_partitioning(
     Ok(result)
 }
 
+/// `Utf8`/`Binary` arrays use `i32` offsets, so one array's values buffer
+/// cannot hold more than `i32::MAX` bytes. Broadcasting one value across `n`
+/// rows materializes `value_len * n` bytes, which must stay under this limit
+/// (`OffsetBuffer::from_repeated_length` panics otherwise). Concatenating
+/// batches into one output batch has the same limit.
+pub(crate) const MAX_BATCH_VAR_BYTES: usize = i32::MAX as usize;
+
 /// Trait for incrementally generating Join output.
 ///
 /// This trait is used to limit some join outputs

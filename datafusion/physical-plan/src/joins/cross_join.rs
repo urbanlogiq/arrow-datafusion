@@ -21,9 +21,9 @@
 use std::{sync::Arc, task::Poll};
 
 use super::utils::{
-    BatchSplitter, BatchTransformer, BuildProbeJoinMetrics, NoopBatchTransformer,
-    OnceAsync, OnceFut, StatefulStreamResult, adjust_right_output_partitioning,
-    reorder_output_after_swap,
+    BatchSplitter, BatchTransformer, BuildProbeJoinMetrics, MAX_BATCH_VAR_BYTES,
+    NoopBatchTransformer, OnceAsync, OnceFut, StatefulStreamResult,
+    adjust_right_output_partitioning, reorder_output_after_swap,
 };
 use crate::execution_plan::{EmissionType, boundedness_from_children};
 use crate::metrics::{ExecutionPlanMetricsSet, MetricsSet};
@@ -38,9 +38,9 @@ use crate::{
     SendableRecordBatchStream, Statistics, check_if_same_properties, handle_state,
 };
 
-use arrow::array::{RecordBatch, RecordBatchOptions};
+use arrow::array::{Array, AsArray, RecordBatch, RecordBatchOptions};
 use arrow::compute::concat_batches;
-use arrow::datatypes::{Fields, Schema, SchemaRef};
+use arrow::datatypes::{DataType, Fields, Schema, SchemaRef};
 use datafusion_common::stats::Precision;
 use datafusion_common::{
     JoinType, Result, ScalarValue, assert_eq_or_internal_err, internal_err,
@@ -210,6 +210,71 @@ impl CrossJoinExec {
             schema: Arc::clone(&self.schema),
         }
     }
+
+    /// [`ExecutionPlan::execute`] with the broadcast byte limit as a
+    /// parameter, so tests can exercise the chunked path with small values.
+    fn execute_with_broadcast_limit(
+        &self,
+        partition: usize,
+        context: Arc<TaskContext>,
+        broadcast_byte_limit: usize,
+    ) -> Result<SendableRecordBatchStream> {
+        assert_eq_or_internal_err!(
+            self.left.output_partitioning().partition_count(),
+            1,
+            "Invalid CrossJoinExec, the output partition count of the left child must be 1,\
+                 consider using CoalescePartitionsExec or the EnforceDistribution rule"
+        );
+
+        let stream = self.right.execute(partition, Arc::clone(&context))?;
+        let join_metrics = BuildProbeJoinMetrics::new(partition, &self.metrics);
+
+        // Initialization of operator-level reservation
+        let reservation =
+            MemoryConsumer::new("CrossJoinExec").register(context.memory_pool());
+
+        let batch_size = context.session_config().batch_size();
+        let enforce_batch_size_in_joins =
+            context.session_config().enforce_batch_size_in_joins();
+
+        let left_fut = self.left_fut.try_once(|| {
+            let left_stream = self.left.execute(0, context)?;
+
+            Ok(load_left_input(
+                left_stream,
+                join_metrics.clone(),
+                reservation,
+            ))
+        })?;
+
+        if enforce_batch_size_in_joins {
+            Ok(Box::pin(CrossJoinStream {
+                schema: Arc::clone(&self.schema),
+                left_fut,
+                right: stream,
+                left_index: 0,
+                right_offset: 0,
+                broadcast_byte_limit,
+                join_metrics,
+                state: CrossJoinStreamState::WaitBuildSide,
+                left_data: RecordBatch::new_empty(self.left().schema()),
+                batch_transformer: BatchSplitter::new(batch_size),
+            }))
+        } else {
+            Ok(Box::pin(CrossJoinStream {
+                schema: Arc::clone(&self.schema),
+                left_fut,
+                right: stream,
+                left_index: 0,
+                right_offset: 0,
+                broadcast_byte_limit,
+                join_metrics,
+                state: CrossJoinStreamState::WaitBuildSide,
+                left_data: RecordBatch::new_empty(self.left().schema()),
+                batch_transformer: NoopBatchTransformer::new(),
+            }))
+        }
+    }
 }
 
 /// Asynchronously collect the result of the left child
@@ -317,58 +382,7 @@ impl ExecutionPlan for CrossJoinExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        assert_eq_or_internal_err!(
-            self.left.output_partitioning().partition_count(),
-            1,
-            "Invalid CrossJoinExec, the output partition count of the left child must be 1,\
-                 consider using CoalescePartitionsExec or the EnforceDistribution rule"
-        );
-
-        let stream = self.right.execute(partition, Arc::clone(&context))?;
-
-        let join_metrics = BuildProbeJoinMetrics::new(partition, &self.metrics);
-
-        // Initialization of operator-level reservation
-        let reservation =
-            MemoryConsumer::new("CrossJoinExec").register(context.memory_pool());
-
-        let batch_size = context.session_config().batch_size();
-        let enforce_batch_size_in_joins =
-            context.session_config().enforce_batch_size_in_joins();
-
-        let left_fut = self.left_fut.try_once(|| {
-            let left_stream = self.left.execute(0, context)?;
-
-            Ok(load_left_input(
-                left_stream,
-                join_metrics.clone(),
-                reservation,
-            ))
-        })?;
-
-        if enforce_batch_size_in_joins {
-            Ok(Box::pin(CrossJoinStream {
-                schema: Arc::clone(&self.schema),
-                left_fut,
-                right: stream,
-                left_index: 0,
-                join_metrics,
-                state: CrossJoinStreamState::WaitBuildSide,
-                left_data: RecordBatch::new_empty(self.left().schema()),
-                batch_transformer: BatchSplitter::new(batch_size),
-            }))
-        } else {
-            Ok(Box::pin(CrossJoinStream {
-                schema: Arc::clone(&self.schema),
-                left_fut,
-                right: stream,
-                left_index: 0,
-                join_metrics,
-                state: CrossJoinStreamState::WaitBuildSide,
-                left_data: RecordBatch::new_empty(self.left().schema()),
-                batch_transformer: NoopBatchTransformer::new(),
-            }))
-        }
+        self.execute_with_broadcast_limit(partition, context, MAX_BATCH_VAR_BYTES)
     }
 
     fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
@@ -504,6 +518,12 @@ struct CrossJoinStream<T> {
     right: SendableRecordBatchStream,
     /// Current value on the left
     left_index: usize,
+    /// Rows of the current probe batch already joined with the current left
+    /// row. A left row joins the probe batch in chunks when one of its
+    /// `Utf8`/`Binary` values is large, see [`max_broadcast_rows`].
+    right_offset: usize,
+    /// Bytes one broadcast left value may take in one output batch
+    broadcast_byte_limit: usize,
     /// Join execution metrics
     join_metrics: BuildProbeJoinMetrics,
     /// State of the stream
@@ -537,6 +557,36 @@ impl CrossJoinStreamState {
             _ => internal_err!("Expected RecordBatch in BuildBatches state"),
         }
     }
+}
+
+/// The number of probe rows one output batch may hold when the left row
+/// `left_index` is broadcast across it: no `Utf8`/`Binary` value of the row
+/// may repeat to more than `byte_limit` bytes, the capacity of an `i32`
+/// offset array (`ScalarValue::to_array_of_size` panics past it). Other types
+/// have no `i32` offsets, or are broadcast with `take`, which reports an
+/// overflow as an error.
+fn max_broadcast_rows(
+    left_data: &RecordBatch,
+    left_index: usize,
+    byte_limit: usize,
+) -> usize {
+    let mut max_rows = usize::MAX;
+    for array in left_data.columns() {
+        if array.is_null(left_index) {
+            continue;
+        }
+        let value_len = match array.data_type() {
+            DataType::Utf8 => array.as_string::<i32>().value(left_index).len(),
+            DataType::Binary => array.as_binary::<i32>().value(left_index).len(),
+            _ => continue,
+        };
+        if value_len == 0 {
+            continue;
+        }
+        max_rows = max_rows.min(byte_limit / value_len);
+    }
+    // One row always fits: the value comes from an `i32` offset array.
+    max_rows.max(1)
 }
 
 fn build_batch(
@@ -633,6 +683,7 @@ impl<T: BatchTransformer> CrossJoinStream<T> {
         cx: &mut std::task::Context<'_>,
     ) -> Poll<Result<StatefulStreamResult<Option<RecordBatch>>>> {
         self.left_index = 0;
+        self.right_offset = 0;
         let right_data = match ready!(self.right.poll_next_unpin(cx)) {
             Some(Ok(right_data)) => right_data,
             Some(Err(e)) => return Poll::Ready(Err(e)),
@@ -652,25 +703,43 @@ impl<T: BatchTransformer> CrossJoinStream<T> {
 
     /// Joins the indexed row of left data with the current probe batch.
     /// If all the results are produced, the state is set to fetch new probe batch.
+    ///
+    /// The probe batch is joined in chunks when a large `Utf8`/`Binary` value
+    /// of the left row would overflow the `i32` offsets of its broadcast
+    /// array; in the common case the chunk is the whole batch.
     fn build_batches(&mut self) -> Result<StatefulStreamResult<Option<RecordBatch>>> {
         let right_batch = self.state.try_as_record_batch()?;
         if self.left_index < self.left_data.num_rows() {
             match self.batch_transformer.next() {
                 None => {
                     let join_timer = self.join_metrics.join_time.timer();
+                    let chunk_rows = max_broadcast_rows(
+                        &self.left_data,
+                        self.left_index,
+                        self.broadcast_byte_limit,
+                    );
+                    let rows =
+                        (right_batch.num_rows() - self.right_offset).min(chunk_rows);
+                    let chunk = if rows == right_batch.num_rows() {
+                        right_batch.clone()
+                    } else {
+                        right_batch.slice(self.right_offset, rows)
+                    };
                     let result = build_batch(
                         self.left_index,
-                        right_batch,
+                        &chunk,
                         &self.left_data,
                         &self.schema,
                     );
                     join_timer.done();
 
+                    self.right_offset += rows;
                     self.batch_transformer.set_batch(result?);
                 }
                 Some((batch, last)) => {
-                    if last {
+                    if last && self.right_offset >= right_batch.num_rows() {
                         self.left_index += 1;
+                        self.right_offset = 0;
                     }
 
                     return Ok(StatefulStreamResult::Ready(Some(batch)));
@@ -687,9 +756,12 @@ impl<T: BatchTransformer> CrossJoinStream<T> {
 mod tests {
     use super::*;
     use crate::common;
-    use crate::test::{assert_join_metrics, build_table_scan_i32};
+    use crate::test::{TestMemoryExec, assert_join_metrics, build_table_scan_i32};
 
+    use arrow::array::{BinaryArray, Int32Array, StringArray};
+    use arrow::datatypes::Field;
     use datafusion_common::{assert_contains, test_util::batches_to_sort_string};
+    use datafusion_execution::config::SessionConfig;
     use datafusion_execution::runtime_env::RuntimeEnvBuilder;
     use insta::assert_snapshot;
 
@@ -981,5 +1053,105 @@ mod tests {
     /// Returns the column names on the schema
     fn columns(schema: &Schema) -> Vec<String> {
         schema.fields().iter().map(|f| f.name().clone()).collect()
+    }
+
+    #[test]
+    fn test_max_broadcast_rows() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("blob", DataType::Binary, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(StringArray::from(vec![Some("aaaa"), None, Some("")])),
+                Arc::new(BinaryArray::from(vec![
+                    Some(&[0u8; 10][..]),
+                    Some(&[0u8; 10][..]),
+                    None,
+                ])),
+            ],
+        )
+        .unwrap();
+
+        // The widest value decides: 100 bytes hold ten copies of 10 bytes.
+        assert_eq!(max_broadcast_rows(&batch, 0, 100), 10);
+        // Null and empty values do not limit the batch.
+        assert_eq!(max_broadcast_rows(&batch, 1, 100), 10);
+        assert_eq!(max_broadcast_rows(&batch, 2, 100), usize::MAX);
+        // One row always fits.
+        assert_eq!(max_broadcast_rows(&batch, 0, 5), 1);
+    }
+
+    /// Two left rows with a 1,000-byte value, five right rows.
+    fn blob_join() -> Result<CrossJoinExec> {
+        let blob = vec![b'x'; 1000];
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("blob", DataType::Binary, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(BinaryArray::from(vec![blob.as_slice(), blob.as_slice()])),
+            ],
+        )?;
+        let left = TestMemoryExec::try_new_exec(&[vec![batch]], schema, None)?;
+        let right = build_table_scan_i32(
+            ("a2", &vec![10, 11, 12, 13, 14]),
+            ("b2", &vec![20, 21, 22, 23, 24]),
+            ("c2", &vec![30, 31, 32, 33, 34]),
+        );
+        Ok(CrossJoinExec::new(left, right))
+    }
+
+    /// A 2,500-byte limit holds two copies of the 1,000-byte value, so each
+    /// left row joins the five right rows in chunks of 2, 2 and 1.
+    #[tokio::test]
+    async fn test_large_left_value_is_broadcast_in_chunks() -> Result<()> {
+        let task_ctx = Arc::new(TaskContext::default());
+        let expected =
+            common::collect(blob_join()?.execute(0, Arc::clone(&task_ctx))?).await?;
+        assert_eq!(expected.len(), 2);
+
+        let join = blob_join()?;
+        let stream = join.execute_with_broadcast_limit(0, task_ctx, 2_500)?;
+        let batches = common::collect(stream).await?;
+        assert_eq!(batches.len(), 6);
+        assert!(batches.iter().all(|batch| batch.num_rows() <= 2));
+        assert_eq!(
+            batches_to_sort_string(&batches),
+            batches_to_sort_string(&expected)
+        );
+        assert_join_metrics!(join.metrics().unwrap(), 10);
+
+        Ok(())
+    }
+
+    /// The batch splitter cuts each chunk again. The left row advances only
+    /// after the last chunk of the probe batch.
+    #[tokio::test]
+    async fn test_chunked_broadcast_with_enforced_batch_size() -> Result<()> {
+        let expected =
+            common::collect(blob_join()?.execute(0, Arc::new(TaskContext::default()))?)
+                .await?;
+
+        let config = SessionConfig::new()
+            .with_batch_size(1)
+            .with_enforce_batch_size_in_joins(true);
+        let task_ctx = Arc::new(TaskContext::default().with_session_config(config));
+        let stream = blob_join()?.execute_with_broadcast_limit(0, task_ctx, 2_500)?;
+        let batches = common::collect(stream).await?;
+        assert_eq!(batches.len(), 10);
+        assert!(batches.iter().all(|batch| batch.num_rows() == 1));
+        assert_eq!(
+            batches_to_sort_string(&batches),
+            batches_to_sort_string(&expected)
+        );
+
+        Ok(())
     }
 }

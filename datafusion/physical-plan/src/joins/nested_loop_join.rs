@@ -31,8 +31,8 @@ use crate::common::can_project;
 use crate::execution_plan::{EmissionType, boundedness_from_children};
 use crate::joins::SharedBitmapBuilder;
 use crate::joins::utils::{
-    BuildProbeJoinMetrics, ColumnIndex, JoinFilter, OnceAsync, OnceFut,
-    build_join_schema, check_join_is_valid, estimate_join_statistics,
+    BuildProbeJoinMetrics, ColumnIndex, JoinFilter, MAX_BATCH_VAR_BYTES, OnceAsync,
+    OnceFut, build_join_schema, check_join_is_valid, estimate_join_statistics,
     need_produce_right_in_final,
 };
 use crate::metrics::{
@@ -2848,14 +2848,6 @@ fn boolean_mask_from_filter(filter_arr: &BooleanArray) -> BooleanArray {
 /// ----
 /// 1 20
 /// 1 40
-/// `Utf8`/`Binary` arrays use `i32` offsets, so a single array's values buffer
-/// cannot hold more than `i32::MAX` bytes. Broadcasting one build-side value
-/// across `n` output rows materializes `value_len * n` bytes, which must stay
-/// under this limit (`OffsetBuffer::from_repeated_length` panics otherwise).
-/// The same limit applies when [`BatchCoalescer`] concatenates buffered
-/// batches into one completed output batch.
-const MAX_BATCH_VAR_BYTES: usize = i32::MAX as usize;
-
 /// Returns true if the data type (or any nested child type) stores
 /// variable-length data behind `i32` offsets (`Utf8`, `Binary`, `List`, `Map`),
 /// i.e. types for which a single array is capped at `i32::MAX` bytes/elements
