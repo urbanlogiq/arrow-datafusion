@@ -676,11 +676,31 @@ fn adjust_window_sort_removal(
 /// the plan, some of the remaining `RepartitionExec`s might become unnecessary.
 /// Removes such `RepartitionExec`s from the plan as well.
 fn remove_bottleneck_in_subplan(
+    requirements: PlanWithCorrespondingCoalescePartitions,
+) -> Result<PlanWithCorrespondingCoalescePartitions> {
+    remove_linked_bottlenecks(requirements, true)
+}
+
+/// Removes the `CoalescePartitionsExec`s linked to `requirements.plan` (see
+/// [`update_coalesce_ctx_children`]).
+///
+/// `is_root` is true for the sort or coalesce that starts the cascade: its own
+/// coalesce child goes even though a sort requires a single partition, because
+/// the caller restructures the sort. Below the root, a link never passes
+/// through a child that its parent requires to be a single partition, so such
+/// a child keeps its coalesce and is not entered. A join with a coalesced
+/// build side and a linked probe side is the typical case.
+fn remove_linked_bottlenecks(
     mut requirements: PlanWithCorrespondingCoalescePartitions,
+    is_root: bool,
 ) -> Result<PlanWithCorrespondingCoalescePartitions> {
     let plan = &requirements.plan;
+    let required_dist = plan.required_input_distribution();
+    let linked = |idx: usize| {
+        is_root || !matches!(required_dist[idx], Distribution::SinglePartition)
+    };
     let children = &mut requirements.children;
-    if is_coalesce_partitions(&children[0].plan) {
+    if is_coalesce_partitions(&children[0].plan) && linked(0) {
         // We can safely use the 0th index since we have a `CoalescePartitionsExec`.
         let mut new_child_node = children[0].children.swap_remove(0);
         while new_child_node.plan.output_partitioning() == plan.output_partitioning()
@@ -694,9 +714,10 @@ fn remove_bottleneck_in_subplan(
         requirements.children = requirements
             .children
             .into_iter()
-            .map(|node| {
-                if node.data {
-                    remove_bottleneck_in_subplan(node)
+            .enumerate()
+            .map(|(idx, node)| {
+                if node.data && linked(idx) {
+                    remove_linked_bottlenecks(node, false)
                 } else {
                     Ok(node)
                 }

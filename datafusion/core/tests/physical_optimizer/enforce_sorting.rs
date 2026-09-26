@@ -44,6 +44,7 @@ use datafusion_physical_expr_common::sort_expr::{
 };
 use datafusion_physical_expr::{Distribution, Partitioning};
 use datafusion_physical_expr::expressions::{col, BinaryExpr, Column, NotExpr};
+use datafusion_physical_plan::joins::NestedLoopJoinExec;
 use datafusion_physical_plan::limit::{GlobalLimitExec, LocalLimitExec};
 use datafusion_physical_plan::repartition::RepartitionExec;
 use datafusion_physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
@@ -1552,6 +1553,51 @@ async fn test_sort_merge_join_complex_order_by() -> Result<()> {
         DataSourceExec: file_groups={1 group: [[x]]}, projection=[col_a, col_b], file_type=parquet
     ");
     // Can push down the sort requirements since col_a = nullable_col
+
+    Ok(())
+}
+
+/// A nested loop join needs its build side in one partition, so the coalesce
+/// there is not a bottleneck of the coalesce above the join. Only the probe
+/// side's coalesce goes.
+#[tokio::test]
+async fn test_keep_coalesce_required_by_join_build_side() -> Result<()> {
+    let schema = create_test_schema()?;
+    let build = coalesce_partitions_exec(repartition_exec(memory_exec(&schema)));
+    let probe = repartition_exec(coalesce_partitions_exec(repartition_exec(
+        memory_exec(&schema),
+    )));
+    let join: Arc<dyn ExecutionPlan> = Arc::new(NestedLoopJoinExec::try_new(
+        build,
+        probe,
+        None,
+        &JoinType::Inner,
+        None,
+    )?);
+    let physical_plan = coalesce_partitions_exec(join);
+
+    let test = EnforceSortingTest::new(physical_plan).with_repartition_sorts(true);
+    assert_snapshot!(test.run(), @r"
+    Input Plan:
+    CoalescePartitionsExec
+      NestedLoopJoinExec: join_type=Inner
+        CoalescePartitionsExec
+          RepartitionExec: partitioning=RoundRobinBatch(10), input_partitions=1
+            DataSourceExec: partitions=1, partition_sizes=[0]
+        RepartitionExec: partitioning=RoundRobinBatch(10), input_partitions=1
+          CoalescePartitionsExec
+            RepartitionExec: partitioning=RoundRobinBatch(10), input_partitions=1
+              DataSourceExec: partitions=1, partition_sizes=[0]
+
+    Optimized Plan:
+    CoalescePartitionsExec
+      NestedLoopJoinExec: join_type=Inner
+        CoalescePartitionsExec
+          RepartitionExec: partitioning=RoundRobinBatch(10), input_partitions=1
+            DataSourceExec: partitions=1, partition_sizes=[0]
+        RepartitionExec: partitioning=RoundRobinBatch(10), input_partitions=1
+          DataSourceExec: partitions=1, partition_sizes=[0]
+    ");
 
     Ok(())
 }
