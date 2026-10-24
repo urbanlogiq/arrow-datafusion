@@ -451,27 +451,56 @@ pub fn aggregate_functional_dependencies(
                 new_source_field_names.push(group_by_expr_name.clone());
             }
         }
-        let existing_target_indices =
-            get_target_functional_dependencies(aggr_input_schema, group_by_expr_names);
         let new_target_indices = get_target_functional_dependencies(
             aggr_input_schema,
             &new_source_field_names,
         );
-        let mode = if existing_target_indices == new_target_indices
-            && new_target_indices.is_some()
-        {
+        // The determinant is a key of the output only when it determines every
+        // GROUP BY expression. A GROUP BY column it does not determine splits
+        // its groups, so the determinant can repeat across output rows.
+        let covers_group_by = new_target_indices.as_ref().is_some_and(|targets| {
+            group_by_expr_names.iter().all(|name| {
+                aggr_input_fields
+                    .iter()
+                    .position(|field| field == name)
+                    .is_some_and(|idx| targets.contains(&idx))
+            })
+        });
+        let mode = if covers_group_by {
             // If dependency covers all GROUP BY expressions, mode will be `Single`:
             Dependency::Single
         } else {
             // Otherwise, existing mode is preserved:
             *mode
         };
+        let dependency_targets = if covers_group_by {
+            target_indices.clone()
+        } else {
+            // A determinant that can repeat keeps only the GROUP BY columns it
+            // determined in the input. The aggregates are computed per group,
+            // and the GROUP BY columns it does not determine split its values.
+            group_by_expr_names
+                .iter()
+                .enumerate()
+                .filter(|(_, name)| {
+                    aggr_input_fields
+                        .iter()
+                        .position(|field| field == *name)
+                        .is_some_and(|idx| {
+                            new_target_indices
+                                .as_ref()
+                                .is_some_and(|targets| targets.contains(&idx))
+                        })
+                })
+                .map(|(out_idx, _)| out_idx)
+                .collect()
+        };
         // All of the composite indices occur in the GROUP BY expression:
         if new_source_indices.len() == source_indices.len() {
             aggregate_func_dependencies.push(
                 FunctionalDependence::new(
                     new_source_indices,
-                    target_indices.clone(),
+                    dependency_targets,
                     *nullable,
                 )
                 .with_mode(mode),
@@ -489,12 +518,14 @@ pub fn aggregate_functional_dependencies(
             .any(|idx| aggr_fields[*idx].is_nullable());
         // If GROUP BY expressions do not already act as a determinant:
         if !aggregate_func_dependencies.iter().any(|item| {
-            // If `item.source_indices` is a subset of GROUP BY expressions, we shouldn't add
-            // them since `item.source_indices` defines this relation already.
+            // If `item.source_indices` is a subset of GROUP BY expressions and
+            // unique, we shouldn't add them since `item.source_indices` defines
+            // this relation already. A determinant that can repeat does not.
 
             // The following simple comparison is working well because
             // GROUP BY expressions come here as a prefix.
-            item.source_indices.iter().all(|idx| idx < &count)
+            item.mode == Dependency::Single
+                && item.source_indices.iter().all(|idx| idx < &count)
         }) {
             // Add a new functional dependency associated with the whole table:
             // Use nullable property of the GROUP BY expression:
@@ -689,6 +720,60 @@ mod tests {
 
         // Project keeping only column 0 - should return None as no constraints are preserved
         assert!(constraints.project(&[0]).is_none());
+    }
+
+    /// The input of `GROUP BY k, name`, after a one-to-many join: `k` (index 0)
+    /// determines `c` (index 1) but not `name` (index 2), and repeats.
+    fn grouped_after_join(k_targets: Vec<usize>) -> (DFSchema, DFSchema) {
+        use arrow::datatypes::{DataType, Field, Schema};
+        let input = DFSchema::try_from(Schema::new(vec![
+            Field::new("k", DataType::Utf8, false),
+            Field::new("c", DataType::Float64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]))
+        .unwrap()
+        .with_functional_dependencies(FunctionalDependencies::new(vec![
+            FunctionalDependence::new(vec![0], k_targets, false)
+                .with_mode(Dependency::Multi),
+        ]))
+        .unwrap();
+        let aggr = DFSchema::try_from(Schema::new(vec![
+            Field::new("k", DataType::Utf8, false),
+            Field::new("name", DataType::Utf8, false),
+            Field::new("min(c)", DataType::Float64, true),
+        ]))
+        .unwrap();
+        (input, aggr)
+    }
+
+    fn mode_of(deps: &FunctionalDependencies, source: &[usize]) -> Option<Dependency> {
+        deps.iter()
+            .find(|dep| dep.source_indices == source)
+            .map(|dep| dep.mode)
+    }
+
+    #[test]
+    fn aggregate_keeps_a_repeating_determinant_multi() {
+        let (input, aggr) = grouped_after_join(vec![0, 1]);
+        let group_by = ["k".to_string(), "name".to_string()];
+        let deps = aggregate_functional_dependencies(&input, &group_by, &aggr);
+        // `k` does not determine `name`, so after the aggregation one `k` can
+        // still have several rows: it must not become a key of the output,
+        // and it determines no column but itself.
+        assert_eq!(mode_of(&deps, &[0]), Some(Dependency::Multi));
+        let k = deps.iter().find(|dep| dep.source_indices == [0]).unwrap();
+        assert_eq!(k.target_indices, vec![0]);
+        // The whole GROUP BY key is unique.
+        assert_eq!(mode_of(&deps, &[0, 1]), Some(Dependency::Single));
+    }
+
+    #[test]
+    fn aggregate_promotes_a_determinant_of_every_group_by_column() {
+        let (input, aggr) = grouped_after_join(vec![0, 1, 2]);
+        let group_by = ["k".to_string(), "name".to_string()];
+        let deps = aggregate_functional_dependencies(&input, &group_by, &aggr);
+        // `k` determines `name` as well, so each `k` has one output row.
+        assert_eq!(mode_of(&deps, &[0]), Some(Dependency::Single));
     }
 
     #[test]
