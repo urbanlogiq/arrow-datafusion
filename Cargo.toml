@@ -202,7 +202,7 @@ tokio-stream = "0.1"
 tokio-util = "0.7"
 url = "2.5.7"
 uuid = "1.23"
-zstd = { version = "0.13", default-features = false }
+zstd = { version = "0.14", default-features = false }
 
 [workspace.lints.clippy]
 # Detects large stack-allocated futures that may cause stack overflow crashes (see threshold in clippy.toml)
