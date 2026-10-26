@@ -1,0 +1,59 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+
+#   http://www.apache.org/licenses/LICENSE-2.0
+
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# A key made unique by one GROUP BY, joined one-to-many and grouped again with
+# another column, must not count as unique afterwards. Otherwise the planner
+# widens the last `GROUP BY k` to every column and returns one row per
+# (k, name) instead of one per k.
+
+statement ok
+CREATE TABLE legs (jid INT NOT NULL, k VARCHAR NOT NULL) AS VALUES (1, 'p'), (2, 'p'), (3, 'q');
+
+statement ok
+CREATE TABLE xw (k VARCHAR NOT NULL, uv VARCHAR NOT NULL) AS VALUES ('p', 'e1'), ('p', 'e2'), ('p', 'e3'), ('q', 'e4');
+
+statement ok
+CREATE TABLE osm (uv VARCHAR NOT NULL, name VARCHAR NOT NULL, len DOUBLE NOT NULL) AS VALUES ('e1', 'Main', 3.0), ('e2', 'Oak', 1.0), ('e3', 'Elm', 0.5), ('e4', 'Pine', 2.0);
+
+query TTITT
+WITH per_hop AS (SELECT k, COUNT(DISTINCT jid) AS journeys FROM legs GROUP BY k),
+xkey AS (SELECT DISTINCT k, uv FROM xw),
+he AS (SELECT per_hop.k AS k, per_hop.journeys AS c, osm.name AS name, osm.len AS len
+       FROM per_hop JOIN xkey ON per_hop.k = xkey.k JOIN osm ON xkey.uv = osm.uv),
+road AS (SELECT k, name, min(c) AS c, sum(len) AS road_len,
+                max(sum(len)) OVER (PARTITION BY k) AS max_len
+         FROM he GROUP BY k, name),
+lbl AS (SELECT k,
+               min(CASE WHEN road_len = max_len THEN name END) AS pname,
+               min(CASE WHEN road_len = max_len THEN c END) AS pc,
+               count(CASE WHEN road_len < max_len THEN 1 END) AS n,
+               min(CASE WHEN road_len < max_len THEN name END) AS lo,
+               max(CASE WHEN road_len < max_len THEN name END) AS hi
+        FROM road GROUP BY k)
+SELECT k, pname, n, lo, hi FROM lbl ORDER BY k
+----
+p Main 2 Elm Oak
+q Pine 0 NULL NULL
+
+statement ok
+DROP TABLE legs;
+
+statement ok
+DROP TABLE xw;
+
+statement ok
+DROP TABLE osm;
